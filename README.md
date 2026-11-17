@@ -4,7 +4,7 @@ A tiny database engine built from scratch in pure Python, using only the standar
 
 ## Status
 
-**Phase 1: key-value store, CLI, append-only log, compaction**
+**Phase 2: object-oriented refactor into Storage, Table, Record, and QueryParser**
 
 ## Quick start
 
@@ -33,11 +33,14 @@ python3 -m unittest discover -s tests -t .
 ## Project structure
 
 ```
-main.py              entry point
-tinydb/__init__.py   package exports
-tinydb/store.py      KeyValueStore: append-only log, replay, compaction
-tinydb/cli.py        one-shot commands and the interactive shell
-tests/test_store.py  unit tests for the store, the log, compaction, and the CLI
+main.py               entry point
+tinydb/__init__.py    package exports
+tinydb/record.py      Record: one key and its value, validated when it's created
+tinydb/storage.py     Storage: the append-only log file (append, replay, atomic rewrite)
+tinydb/table.py       Table: a collection of Records saved through a Storage
+tinydb/query.py       QueryParser: turns typed commands into Query objects
+tinydb/cli.py         runs Queries against a Table, plus the interactive shell
+tests/                one test file per class, plus test_cli.py
 ```
 
 ## Phase 1 design: an append-only log
@@ -58,6 +61,23 @@ The data lives in `tinydb.jsonl`, a JSON-lines file where every line is one chan
 This is the same idea behind Bitcask (Riak's storage engine), Redis's AOF file, and the LSM-tree logs in Cassandra and RocksDB. Phase 4's write-ahead log grows out of it.
 
 **Trade-offs:** writes are fast because appending is O(1), but startup time grows with the size of the log, and every key has to fit in memory. Compaction fixes the first problem. Indexes in Phase 3 start on the second.
+
+## Phase 2 design: one job per class
+
+Phase 1 had one class, `KeyValueStore`, that validated input, wrote the file, replayed it, and held the data. Phase 2 splits those jobs apart so each class has a **single responsibility**:
+
+```
+typed text --> QueryParser --> Query --> cli.execute() --> Table --> Storage --> tinydb.jsonl
+                                                             |
+                                                           Record
+```
+
+- **Record** is a small frozen dataclass (`key`, `value`). It checks its own key and value when it's created, so every other class can trust it.
+- **Storage** only reads and writes lines of JSON. It doesn't know what "set" or "delete" mean. `replay(apply)` hands each entry to a function the Table passes in, which is the same recovery loop a write-ahead log uses.
+- **Table** holds Records in a dict for O(1) reads and turns changes into log entries. It's given a Storage instead of building one inside itself (**dependency injection**), so a test or a future WAL can swap in a different one.
+- **QueryParser** turns words into a `Query` object and never touches data. Executing a Query is a separate step. Phase 4's mini-SQL parser will produce Query objects the same way.
+
+The file format didn't change, so a Phase 1 `tinydb.jsonl` still opens.
 
 ## Roadmap
 
