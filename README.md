@@ -4,7 +4,7 @@ A tiny database engine built from scratch in pure Python, using only the standar
 
 ## Status
 
-**Phase 2: object-oriented refactor into Storage, Table, Record, and QueryParser**
+**Phase 3: hash and B-tree indexes, sorting, and search**
 
 ## Quick start
 
@@ -24,6 +24,24 @@ python3 main.py --db other.jsonl keys # use a different database file
 Commands: `set`, `get`, `delete`, `exists`, `keys`, `count`, `compact`, `clear`, `help`, `exit`.
 Values that are valid JSON (`42`, `true`, `[1,2]`, `{"a":1}`) are stored as that type. Anything else is stored as text.
 
+### Searching
+
+When values are JSON objects, you can search by any field inside them:
+
+```bash
+python3 main.py set c1 '{"name": "Ada", "plan": "PPO", "age": 70}'
+python3 main.py set c2 '{"name": "Bob", "plan": "HMO", "age": 66}'
+python3 main.py find plan PPO          # field equals a value
+python3 main.py range age 65 70        # field between two values (use - for no limit)
+python3 main.py sort age desc          # sorted by a field
+python3 main.py index plan             # hash index: fast find
+python3 main.py index age btree        # B-tree index: fast find, range and sort
+python3 main.py indexes
+python3 main.py unindex plan
+```
+
+Every search prints how it ran, for example `(2 records, btree index on age)` or `(1 record, full scan)`.
+
 ## Run the tests
 
 ```bash
@@ -37,10 +55,14 @@ main.py               entry point
 tinydb/__init__.py    package exports
 tinydb/record.py      Record: one key and its value, validated when it's created
 tinydb/storage.py     Storage: the append-only log file (append, replay, atomic rewrite)
-tinydb/table.py       Table: a collection of Records saved through a Storage
+tinydb/table.py       Table: Records saved through a Storage, plus indexes and search
 tinydb/query.py       QueryParser: turns typed commands into Query objects
 tinydb/cli.py         runs Queries against a Table, plus the interactive shell
-tests/                one test file per class, plus test_cli.py
+tinydb/algorithms.py  binary search and merge sort, written by hand
+tinydb/hashtable.py   HashTable: a hash map with separate chaining and resizing
+tinydb/btree.py       BTree: a balanced B-tree with insert, delete and range reads
+tinydb/index.py       HashIndex and BTreeIndex on a field inside each value
+tests/                one test file per module, plus test_cli.py
 ```
 
 ## Phase 1 design: an append-only log
@@ -60,7 +82,7 @@ The data lives in `tinydb.jsonl`, a JSON-lines file where every line is one chan
 
 This is the same idea behind Bitcask (Riak's storage engine), Redis's AOF file, and the LSM-tree logs in Cassandra and RocksDB. Phase 4's write-ahead log grows out of it.
 
-**Trade-offs:** writes are fast because appending is O(1), but startup time grows with the size of the log, and every key has to fit in memory. Compaction fixes the first problem. Indexes in Phase 3 start on the second.
+**Trade-offs:** writes are fast because appending is O(1), but startup time grows with the size of the log, and every key has to fit in memory. Compaction fixes the first problem. The second is still true after Phase 3: indexes live in memory too, and are rebuilt from the log on startup.
 
 ## Phase 2 design: one job per class
 
@@ -78,6 +100,24 @@ typed text --> QueryParser --> Query --> cli.execute() --> Table --> Storage -->
 - **QueryParser** turns words into a `Query` object and never touches data. Executing a Query is a separate step. Phase 4's mini-SQL parser will produce Query objects the same way.
 
 The file format didn't change, so a Phase 1 `tinydb.jsonl` still opens.
+
+## Phase 3 design: indexes
+
+Phase 2 could only find a record by its key. Finding "every client on a PPO plan" meant opening every record, a **full scan**, O(n). Phase 3 adds **indexes** on fields inside the values, built from scratch with no `dict` or `bisect` doing the real work:
+
+| Structure | File | Cost | Used for |
+|---|---|---|---|
+| Binary search | `algorithms.py` | O(log n) | finding a key's place inside a B-tree node |
+| Merge sort | `algorithms.py` | O(n log n), stable | sorting when there's no B-tree index |
+| Hash table | `hashtable.py` | O(1) average | `HashIndex`: "field equals value" |
+| B-tree | `btree.py` | O(log n) | `BTreeIndex`: equals, ranges, and sorted order |
+
+- **An index maps a field's values to record keys.** An index on `plan` stores `"PPO" -> {"c1", "c3"}`, so `find plan PPO` is one lookup instead of a scan.
+- **Hash vs B-tree.** A hash index is the fastest for exact matches but keeps values in no order, so it can't help with a range. A B-tree keeps values sorted, so a range is O(log n + k) and `sort` reads it in order with no sorting step.
+- **A tiny query planner.** `find`, `range` and `sort` each check for an index that can answer them, and fall back to a full scan (plus merge sort) when there isn't one. Every search reports which plan ran, like SQL's `EXPLAIN`. The tests check that both plans always give the same answer.
+- **Comparing mixed JSON values.** One field can hold a number in one record and text in another, and Python can't compare `70 < "seventy"`. `index_key` turns each value into a `(type rank, value)` tuple, so null < booleans < numbers < strings < lists < objects. The same key is used for hashing, so both index types and the full scan agree on what "equal" means.
+- **Indexes are saved in the log, but not their contents.** `index age btree` appends `{"op": "index", "field": "age", "kind": "btree"}`, and `unindex` appends `{"op": "drop_index", ...}`. On startup, replay rebuilds each index from the records. Compaction writes index lines first. `set` and `delete` lines didn't change, so a Phase 1 or 2 log still opens.
+- **The cost of an index.** Every `set` and `delete` updates every index too, and each index uses memory. Indexes speed up reads and slow down writes, which is why you index the fields you search on, not all of them.
 
 ## Roadmap
 

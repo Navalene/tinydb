@@ -89,5 +89,54 @@ class CliTests(unittest.TestCase):
         self.assertIn("corrupted at line 1", err.getvalue())
 
 
+    # ---- Phase 3: index and search commands ----
+
+    def add_clients(self):
+        self.run_cli("set", "c1", '{"name": "Ada", "plan": "PPO", "age": 70}')
+        self.run_cli("set", "c2", '{"name": "Bob", "plan": "HMO", "age": 66}')
+        self.run_cli("set", "c3", '{"name": "Cy", "plan": "PPO", "age": 81}')
+
+    def test_find_prints_records_and_plan(self):
+        self.add_clients()
+        self.assertEqual(self.run_cli("find", "plan", "HMO"), (0, (
+            'c2: {"name": "Bob", "plan": "HMO", "age": 66}\n'
+            "(1 record, full scan)"
+        )))
+
+    def test_find_nothing(self):
+        self.assertEqual(self.run_cli("find", "plan", "PFFS"), (0, "(0 records, full scan)"))
+
+    def test_index_commands(self):
+        self.assertEqual(self.run_cli("indexes"), (0, "(no indexes)"))
+        self.assertEqual(self.run_cli("index", "plan"), (0, "Created hash index on plan"))
+        self.assertEqual(self.run_cli("index", "plan"), (0, "plan already has a hash index"))
+        self.assertEqual(self.run_cli("index", "age", "btree"), (0, "Created btree index on age"))
+        self.assertEqual(self.run_cli("indexes"), (0, "age (btree)\nplan (hash)"))
+        self.assertEqual(self.run_cli("unindex", "plan"), (0, "Dropped index on plan"))
+        self.assertEqual(self.run_cli("unindex", "plan"), (1, "No index on plan"))
+
+    def test_find_uses_the_index(self):
+        self.add_clients()
+        self.run_cli("index", "plan")
+        code, output = self.run_cli("find", "plan", "PPO")
+        self.assertEqual(code, 0)
+        self.assertEqual(output.splitlines()[-1], "(2 records, hash index on plan)")
+
+    def test_range_and_sort(self):
+        self.add_clients()
+        self.run_cli("index", "age", "btree")
+        _, output = self.run_cli("range", "age", "65", "75")
+        self.assertEqual([line[:2] for line in output.splitlines()], ["c2", "c1", "(2"])
+        self.assertTrue(output.endswith("btree index on age)"))
+        _, output = self.run_cli("sort", "age", "desc")
+        self.assertEqual([line[:2] for line in output.splitlines()], ["c3", "c1", "c2", "(3"])
+
+    def test_main_index_survives_between_commands(self):
+        with redirect_stdout(io.StringIO()) as out:
+            main(["--db", self.path, "set", "c1", '{"plan": "PPO"}'])
+            main(["--db", self.path, "index", "plan"])
+            main(["--db", self.path, "find", "plan", "PPO"])
+        self.assertTrue(out.getvalue().endswith("(1 record, hash index on plan)\n"))
+
 if __name__ == "__main__":
     unittest.main()

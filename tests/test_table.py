@@ -183,5 +183,153 @@ class TableTests(unittest.TestCase):
         self.assertEqual(value_of(self.reopen(), "a"), 1)
 
 
+class TableSearchTests(unittest.TestCase):
+    """Indexes and searching. Every search is checked with and without an index."""
+
+    CLIENTS = {
+        "c1": {"name": "Ada", "plan": "PPO", "age": 70},
+        "c2": {"name": "Bob", "plan": "HMO", "age": 66},
+        "c3": {"name": "Cy", "plan": "PPO", "age": 81},
+        "c4": {"name": "Di", "age": 66},
+        "note": "not a client",
+    }
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="tinydb-test-")
+        self.path = os.path.join(self.tmpdir.name, "clients.jsonl")
+        self.table = Table.open(self.path)
+        for key, value in self.CLIENTS.items():
+            self.table.set(key, value)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def reopen(self):
+        return Table.open(self.path)
+
+    def keys_of(self, records):
+        return [record.key for record in records]
+
+    def test_find_without_an_index_scans(self):
+        self.assertEqual(self.keys_of(self.table.find("plan", "PPO")), ["c1", "c3"])
+        self.assertEqual(self.table.last_plan, "full scan")
+
+    def test_find_with_each_kind_of_index(self):
+        for kind in ("hash", "btree"):
+            self.assertTrue(self.table.create_index("plan", kind))
+            self.assertEqual(self.keys_of(self.table.find("plan", "PPO")), ["c1", "c3"])
+            self.assertEqual(self.table.last_plan, f"{kind} index on plan")
+
+    def test_find_matches_numbers_not_text(self):
+        self.assertEqual(self.keys_of(self.table.find("age", 66)), ["c2", "c4"])
+        self.assertEqual(self.table.find("age", "66"), [])
+
+    def test_find_no_matches(self):
+        self.table.create_index("plan")
+        self.assertEqual(self.table.find("plan", "PFFS"), [])
+        self.assertEqual(self.table.find("nothing", "here"), [])
+
+    def test_indexes_list(self):
+        self.assertEqual(self.table.indexes(), [])
+        self.table.create_index("plan")
+        self.table.create_index("age", "btree")
+        self.assertEqual(self.table.indexes(), [("age", "btree"), ("plan", "hash")])
+
+    def test_create_same_index_twice_returns_false(self):
+        self.assertTrue(self.table.create_index("plan"))
+        self.assertFalse(self.table.create_index("plan"))
+        self.assertTrue(self.table.create_index("plan", "btree"))
+        self.assertEqual(self.table.indexes(), [("plan", "btree")])
+
+    def test_bad_index_requests(self):
+        with self.assertRaises(ValueError):
+            self.table.create_index("plan", "bitmap")
+        with self.assertRaises(ValueError):
+            self.table.create_index("")
+        with self.assertRaises(ValueError):
+            self.table.find("", "x")
+
+    def test_drop_index(self):
+        self.table.create_index("plan")
+        self.assertTrue(self.table.drop_index("plan"))
+        self.assertFalse(self.table.drop_index("plan"))
+        self.table.find("plan", "PPO")
+        self.assertEqual(self.table.last_plan, "full scan")
+
+    def test_index_follows_set_and_delete(self):
+        self.table.create_index("plan")
+        self.table.set("c2", {"name": "Bob", "plan": "PPO", "age": 66})
+        self.table.set("c5", {"name": "Eve", "plan": "HMO"})
+        self.table.delete("c1")
+        self.assertEqual(self.keys_of(self.table.find("plan", "PPO")), ["c2", "c3"])
+        self.assertEqual(self.keys_of(self.table.find("plan", "HMO")), ["c5"])
+
+    def test_indexes_survive_restart(self):
+        self.table.create_index("plan")
+        self.table.create_index("age", "btree")
+        self.table.drop_index("plan")
+        reopened = self.reopen()
+        self.assertEqual(reopened.indexes(), [("age", "btree")])
+        self.assertEqual(self.keys_of(reopened.find("age", 66)), ["c2", "c4"])
+        self.assertEqual(reopened.last_plan, "btree index on age")
+
+    def test_index_entries_in_the_log(self):
+        self.table.create_index("age", "btree")
+        self.table.drop_index("age")
+        self.assertEqual(read_log(self.path)[-2:], [
+            {"op": "index", "field": "age", "kind": "btree"},
+            {"op": "drop_index", "field": "age"},
+        ])
+
+    def test_compact_keeps_indexes(self):
+        self.table.create_index("plan")
+        self.table.compact()
+        self.assertEqual(read_log(self.path)[0], {"op": "index", "field": "plan", "kind": "hash"})
+        self.assertEqual(self.table.log_entries, 6)
+        self.assertEqual(self.reopen().indexes(), [("plan", "hash")])
+
+    def test_clear_keeps_indexes_but_empties_them(self):
+        self.table.create_index("plan")
+        self.table.clear()
+        self.assertEqual(self.table.find("plan", "PPO"), [])
+        self.table.set("c9", {"plan": "PPO"})
+        self.assertEqual(self.keys_of(self.table.find("plan", "PPO")), ["c9"])
+        self.assertEqual(self.reopen().indexes(), [("plan", "hash")])
+
+    def test_find_range_with_and_without_btree(self):
+        expected = ["c2", "c4", "c1"]
+        self.assertEqual(self.keys_of(self.table.find_range("age", 65, 75)), expected)
+        self.assertEqual(self.table.last_plan, "full scan")
+        self.table.create_index("age", "hash")
+        self.assertEqual(self.keys_of(self.table.find_range("age", 65, 75)), expected)
+        self.assertEqual(self.table.last_plan, "full scan")
+        self.table.create_index("age", "btree")
+        self.assertEqual(self.keys_of(self.table.find_range("age", 65, 75)), expected)
+        self.assertEqual(self.table.last_plan, "btree index on age")
+
+    def test_find_range_open_ended(self):
+        for _ in range(2):
+            self.assertEqual(self.keys_of(self.table.find_range("age", low=70)), ["c1", "c3"])
+            self.assertEqual(self.keys_of(self.table.find_range("age", high=66)), ["c2", "c4"])
+            self.table.create_index("age", "btree")
+
+    def test_sort_by_with_and_without_btree(self):
+        expected = ["c2", "c4", "c1", "c3"]
+        self.assertEqual(self.keys_of(self.table.sort_by("age")), expected)
+        self.assertEqual(self.table.last_plan, "full scan + merge sort")
+        self.table.create_index("age", "btree")
+        self.assertEqual(self.keys_of(self.table.sort_by("age")), expected)
+        self.assertEqual(self.table.last_plan, "btree index on age")
+
+    def test_sort_by_reverse_keeps_ties_sorted_by_key(self):
+        expected = ["c3", "c1", "c2", "c4"]
+        self.assertEqual(self.keys_of(self.table.sort_by("age", reverse=True)), expected)
+        self.table.create_index("age", "btree")
+        self.assertEqual(self.keys_of(self.table.sort_by("age", reverse=True)), expected)
+
+    def test_sort_by_text_field_skips_records_without_it(self):
+        self.assertEqual(self.keys_of(self.table.sort_by("plan")), ["c2", "c1", "c3"])
+
+
 if __name__ == "__main__":
     unittest.main()

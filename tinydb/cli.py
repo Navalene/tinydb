@@ -25,6 +25,14 @@ HELP_TEXT = """Commands:
   count               print the number of keys
   clear               remove all keys
   compact             shrink the log file down to just the live keys
+
+Searching values that are JSON objects, like {"name": "Ada", "plan": "PPO", "age": 70}:
+  find <field> <value>        records whose field equals value
+  range <field> <low> <high>  records whose field is between low and high (- for no limit)
+  sort <field> [asc|desc]     records that have field, sorted by it
+  index <field> [hash|btree]  index a field so find (hash) or find, range and sort (btree) are fast
+  unindex <field>             remove a field's index
+  indexes                     list indexes
   help                show this message
   exit                quit the interactive prompt"""
 
@@ -36,6 +44,14 @@ def format_value(value):
     if isinstance(value, str):
         return value
     return json.dumps(value)
+
+
+def print_records(records, plan, out):
+    """Print one record per line, then how many there were and how the search ran."""
+    for record in records:
+        print(f"{record.key}: {format_value(record.value)}", file=out)
+    noun = "record" if len(records) == 1 else "records"
+    print(f"({len(records)} {noun}, {plan})", file=out)
 
 
 def execute(table, query, out=None):
@@ -84,6 +100,40 @@ def execute(table, query, out=None):
         before = table.log_entries
         table.compact()
         print(f"Compacted log from {before} to {table.log_entries} entries", file=out)
+        return 0
+
+    if command == "index":
+        if table.create_index(query.field, query.kind):
+            print(f"Created {query.kind} index on {query.field}", file=out)
+        else:
+            print(f"{query.field} already has a {query.kind} index", file=out)
+        return 0
+
+    if command == "unindex":
+        if table.drop_index(query.field):
+            print(f"Dropped index on {query.field}", file=out)
+            return 0
+        print(f"No index on {query.field}", file=out)
+        return 1
+
+    if command == "indexes":
+        indexes = table.indexes()
+        if not indexes:
+            print("(no indexes)", file=out)
+        for field, kind in indexes:
+            print(f"{field} ({kind})", file=out)
+        return 0
+
+    if command == "find":
+        print_records(table.find(query.field, query.value), table.last_plan, out)
+        return 0
+
+    if command == "range":
+        print_records(table.find_range(query.field, query.low, query.high), table.last_plan, out)
+        return 0
+
+    if command == "sort":
+        print_records(table.sort_by(query.field, query.descending), table.last_plan, out)
         return 0
 
     if command == "clear":

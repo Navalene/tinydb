@@ -24,7 +24,7 @@ class QueryParserTests(unittest.TestCase):
             self.assertEqual(self.parser.parse([command, "name"]), Query(command, key="name"))
 
     def test_commands_without_arguments(self):
-        for command in ("keys", "count", "clear", "compact", "help", "exit"):
+        for command in ("keys", "count", "clear", "compact", "indexes", "help", "exit"):
             self.assertEqual(self.parser.parse([command]), Query(command))
 
     def test_command_is_case_insensitive(self):
@@ -66,6 +66,51 @@ class QueryParserTests(unittest.TestCase):
     def test_query_error_is_a_value_error(self):
         self.assertTrue(issubclass(QueryError, ValueError))
 
+
+    # ---- Phase 3: index and search commands ----
+
+    def test_index_defaults_to_hash(self):
+        self.assertEqual(self.parser.parse(["index", "plan"]), Query("index", field="plan", kind="hash"))
+
+    def test_index_btree(self):
+        query = self.parser.parse(["index", "age", "BTREE"])
+        self.assertEqual(query, Query("index", field="age", kind="btree"))
+
+    def test_index_unknown_kind(self):
+        with self.assertRaises(QueryError) as cm:
+            self.parser.parse(["index", "age", "bitmap"])
+        self.assertIn("Unknown index kind: bitmap", str(cm.exception))
+
+    def test_unindex(self):
+        self.assertEqual(self.parser.parse(["unindex", "plan"]), Query("unindex", field="plan"))
+
+    def test_find_parses_the_value(self):
+        self.assertEqual(self.parser.parse(["find", "age", "70"]), Query("find", field="age", value=70))
+        query = self.parser.parse(["find", "plan", "Medicare", "Advantage"])
+        self.assertEqual(query, Query("find", field="plan", value="Medicare Advantage"))
+
+    def test_range(self):
+        query = self.parser.parse(["range", "age", "65", "70"])
+        self.assertEqual(query, Query("range", field="age", low=65, high=70))
+
+    def test_range_dash_means_no_limit(self):
+        query = self.parser.parse(["range", "age", "65", "-"])
+        self.assertEqual(query, Query("range", field="age", low=65, high=None))
+
+    def test_sort(self):
+        self.assertEqual(self.parser.parse(["sort", "age"]), Query("sort", field="age"))
+        self.assertEqual(self.parser.parse(["sort", "age", "asc"]), Query("sort", field="age"))
+        self.assertEqual(self.parser.parse(["sort", "age", "DESC"]), Query("sort", field="age", descending=True))
+
+    def test_field_commands_wrong_arguments(self):
+        cases = [
+            ["index"], ["index", "a", "hash", "extra"], ["unindex"], ["unindex", "a", "b"],
+            ["find"], ["find", "plan"], ["range", "age", "65"], ["sort"], ["sort", "age", "sideways"],
+        ]
+        for words in cases:
+            with self.assertRaises(QueryError) as cm:
+                self.parser.parse(words)
+            self.assertTrue(str(cm.exception).startswith("Usage: "), words)
 
 if __name__ == "__main__":
     unittest.main()
