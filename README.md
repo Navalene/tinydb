@@ -4,7 +4,7 @@ A tiny database engine built from scratch in pure Python, using only the standar
 
 ## Status
 
-**Phase 4: tables, schemas, mini-SQL, and a write-ahead log**
+**Phase 5: requirements, architecture and API spec.** The engine is complete through Phase 4 (tables, schemas, mini-SQL, write-ahead log). Phase 5 designs the HTTP API, which Phase 6 builds.
 
 ## Quick start
 
@@ -83,6 +83,15 @@ Types: `INT`, `FLOAT`, `TEXT`, `BOOL` (`TRUE`/`FALSE`), `DATE` (`'YYYY-MM-DD'`).
 rm -rf demo_data && python3 main.py --dir demo_data < demo.sql
 ```
 
+## Design documents
+
+| Document | What it covers |
+|---|---|
+| [docs/requirements.md](docs/requirements.md) | Users, use cases, and numbered requirements, each traced to the test file that checks it |
+| [docs/architecture.md](docs/architecture.md) | Layer, class, sequence and recovery diagrams, and the design decisions with their trade-offs |
+| [docs/api-spec.md](docs/api-spec.md) | The HTTP API: `QUERY /query` for reads, `POST /execute` for writes, JSON responses and errors |
+| [docs/openapi.yaml](docs/openapi.yaml) | The same API in OpenAPI 3.2, which can describe the `QUERY` method |
+
 ## Run the tests
 
 ```bash
@@ -109,6 +118,7 @@ tinydb/lexer.py       splits SQL text into tokens
 tinydb/sql.py         SqlParser: recursive-descent parser, tokens into statement objects
 tinydb/database.py    Database: tables in a folder, runs statements, picks a query plan
 demo.sql              Medicare demo script
+docs/                 requirements, architecture and API spec
 tests/                one test file per module, plus test_cli.py
 ```
 
@@ -184,6 +194,15 @@ SQL text --> lexer --> parser --> statement --> Database.execute() --> Result
 - **Write-ahead log.** Every change is logged and fsynced before memory changes. A statement that writes several rows (multi-row `INSERT`, `UPDATE`, `DELETE`) is written as one transaction: a `begin` line, the changes, and a `commit` line, with one fsync (group commit). On startup only committed transactions are replayed, and an unfinished one at the end of the log is rolled back and trimmed. That makes each statement atomic. Lines outside a transaction still count on their own, so Phase 1 to 3 logs open unchanged. Compaction rewrites the log without transaction markers, acting as a checkpoint.
 
 **Trade-offs and limits:** no joins, `OR`, `GROUP BY` or multi-statement transactions yet; one primary-key column per table; every table still lives in memory. Each statement is atomic, but a script of several statements is not.
+
+## Phase 5 design: planning the API
+
+Phase 5 is design work, written before the server exists:
+
+- **Requirements with traceability.** Every functional requirement has an ID (`FR-1` to `FR-28`), the phase that built it, and the test file that checks it. Non-functional requirements cover durability, speed, security and maintainability.
+- **Diagrams as code.** The architecture diagrams are Mermaid text, so GitHub draws them and they change in the same commits as the code.
+- **Reads use HTTP QUERY.** `QUERY` became a standard in June 2026 ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008)). It's safe and idempotent like `GET`, but the SQL goes in the request body instead of the URL. Because a QUERY must never change data, the server parses the whole body first and refuses it if any statement writes. Writes use `POST /execute`, so the method alone tells clients and caches whether a request changes data.
+- **Built on what exists.** The server will call the same `parse` and `Database.execute` as the shell and turn each `Result` into JSON. Nothing below the server changes.
 
 ## Roadmap
 

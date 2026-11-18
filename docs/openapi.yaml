@@ -1,0 +1,248 @@
+# tinydb HTTP API, as an OpenAPI 3.2 description.
+# The human-readable version is api-spec.md. Built in Phase 6.
+openapi: 3.2.0
+info:
+  title: tinydb HTTP API
+  version: 0.5.0
+  description: >
+    Mini-SQL over HTTP. Reads use the QUERY method (RFC 10008) on /query.
+    Writes use POST on /execute. The method tells you whether a request
+    can change data.
+servers:
+  - url: http://127.0.0.1:8000
+    description: Local server (listens on this computer only)
+
+security:
+  - apiKey: []
+
+paths:
+  /query:
+    query:
+      summary: Run read statements
+      description: >
+        Runs SELECT, SHOW TABLES and DESCRIBE. QUERY is safe, so the whole
+        body is parsed first, and if any statement would change data the
+        request is refused with WrongMethod and nothing runs.
+      operationId: runQuery
+      requestBody:
+        $ref: "#/components/requestBodies/Sql"
+      responses:
+        "200":
+          description: Every statement ran
+          headers:
+            Accept-Query:
+              $ref: "#/components/headers/AcceptQuery"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Results"
+              example:
+                results:
+                  - message: 2 rows
+                    columns: [client_id, reason, deadline]
+                    rows:
+                      - [2, Has Medicaid, "2026-12-15"]
+                      - [5, Moved to a new ZIP code, "2026-12-31"]
+                    plan: btree index on deadline + merge sort
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "411":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
+    options:
+      summary: Methods and body formats /query accepts
+      operationId: queryOptions
+      security: []
+      responses:
+        "204":
+          description: No body
+          headers:
+            Allow:
+              description: QUERY, OPTIONS
+              schema:
+                type: string
+            Accept-Query:
+              $ref: "#/components/headers/AcceptQuery"
+
+  /execute:
+    post:
+      summary: Run write statements
+      description: >
+        Runs CREATE TABLE, DROP TABLE, CREATE INDEX, INSERT, UPDATE and DELETE.
+        Each statement is atomic. Several statements run in order and stop at
+        the first error; earlier ones stay saved and are listed in results.
+        A read statement is refused with WrongMethod before anything runs.
+      operationId: runExecute
+      requestBody:
+        $ref: "#/components/requestBodies/Sql"
+      responses:
+        "200":
+          description: Every statement ran
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Results"
+              example:
+                results:
+                  - message: Inserted 2 rows
+                    columns: []
+                    rows: []
+                    plan: ""
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "411":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
+    options:
+      summary: Methods /execute accepts
+      operationId: executeOptions
+      security: []
+      responses:
+        "204":
+          description: No body
+          headers:
+            Allow:
+              description: POST, OPTIONS
+              schema:
+                type: string
+
+  /health:
+    get:
+      summary: Check the server is running
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: The server is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+                  version:
+                    type: string
+                    example: 0.6.0
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: "An API key, sent as Authorization: Bearer <key>. Added in Phase 6."
+
+  headers:
+    AcceptQuery:
+      description: Body formats this resource accepts with QUERY (RFC 10008)
+      schema:
+        type: string
+        example: application/sql
+
+  requestBodies:
+    Sql:
+      required: true
+      description: One or more SQL statements separated by semicolons. At most 1 MB.
+      content:
+        application/sql:
+          schema:
+            type: string
+            maxLength: 1048576
+          example: >
+            SELECT client_id, reason, deadline FROM enrollment_periods
+            WHERE period = 'SEP' AND deadline >= '2026-11-18'
+            ORDER BY deadline;
+
+  schemas:
+    Value:
+      description: "A cell: INT or FLOAT is a number, TEXT and DATE (YYYY-MM-DD) are strings, BOOL is a boolean, NULL is null."
+      type: [string, number, boolean, "null"]
+    Result:
+      type: object
+      required: [message, columns, rows, plan]
+      properties:
+        message:
+          type: string
+          example: 2 rows
+        columns:
+          type: array
+          items:
+            type: string
+        rows:
+          type: array
+          items:
+            type: array
+            items:
+              $ref: "#/components/schemas/Value"
+        plan:
+          type: string
+          example: primary key lookup
+    Results:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Result"
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              enum: [SqlError, SchemaError, DatabaseError, WrongMethod, EmptyRequest,
+                     BadRequest, Unauthorized, NotFound, MethodNotAllowed,
+                     LengthRequired, TooLarge, UnsupportedMediaType, InternalError]
+            message:
+              type: string
+        results:
+          description: Statements that ran before the error (POST /execute only)
+          type: array
+          items:
+            $ref: "#/components/schemas/Result"
+
+  responses:
+    Error:
+      description: The request was refused. See error.type.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: SQL, schema or method error. Nothing in the body ran, except earlier statements of a POST.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              type: WrongMethod
+              message: DELETE changes data, so send it with POST /execute. Nothing was run.
+    Unauthorized:
+      description: Missing or wrong API key (Phase 6)
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
