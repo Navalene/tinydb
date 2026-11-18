@@ -6,12 +6,17 @@ Two ways to use it:
 
 Each command goes through two steps: QueryParser turns the words into a Query,
 then execute() runs that Query against a Table.
+
+Phase 4 adds SQL. A line that starts with a SQL word (SELECT, INSERT, ...) or
+ends with ";" is SQL, and runs against the Database in the --dir folder. In the
+interactive prompt a SQL statement can span several lines and ends at ";".
 """
 
 import argparse
 import json
 import sys
 
+from tinydb.database import Database
 from tinydb.query import QueryError, QueryParser
 from tinydb.storage import CorruptLogError
 from tinydb.table import Table
@@ -33,10 +38,23 @@ Searching values that are JSON objects, like {"name": "Ada", "plan": "PPO", "age
   index <field> [hash|btree]  index a field so find (hash) or find, range and sort (btree) are fast
   unindex <field>             remove a field's index
   indexes                     list indexes
+
+SQL (end each statement with ;):
+  CREATE TABLE clients (id INT PRIMARY KEY, name TEXT NOT NULL, age INT);
+  INSERT INTO clients VALUES (1, 'Ada', 70), (2, 'Bob', 66);
+  SELECT name, age FROM clients WHERE age >= 65 ORDER BY age DESC LIMIT 10;
+  UPDATE clients SET age = 71 WHERE id = 1;
+  DELETE FROM clients WHERE id = 2;
+  CREATE INDEX ON clients (age);            -- btree; add USING HASH for a hash index
+  SHOW TABLES;  DESCRIBE clients;  DROP TABLE clients;
+  Types: INT, FLOAT, TEXT, BOOL, DATE ('YYYY-MM-DD')
+
   help                show this message
   exit                quit the interactive prompt"""
 
 parser = QueryParser()
+
+SQL_STARTS = ("CREATE", "DROP", "INSERT", "SELECT", "UPDATE", "SHOW", "DESCRIBE")
 
 
 def format_value(value):
@@ -52,6 +70,53 @@ def print_records(records, plan, out):
         print(f"{record.key}: {format_value(record.value)}", file=out)
     noun = "record" if len(records) == 1 else "records"
     print(f"({len(records)} {noun}, {plan})", file=out)
+
+
+def is_sql(text):
+    """True if text is SQL rather than a key-value command."""
+    words = text.split()
+    if not words:
+        return False
+    if text.rstrip().endswith(";") or words[0].upper() in SQL_STARTS:
+        return True
+    # "delete name" is the key-value command; "DELETE FROM clients" is SQL.
+    return words[0].upper() == "DELETE" and len(words) > 1 and words[1].upper() == "FROM"
+
+
+def format_cell(value):
+    """How one value looks in a result table. Missing values show as NULL."""
+    if value is None:
+        return "NULL"
+    return format_value(value)
+
+
+def print_result(result, out):
+    """Print a Result: a table of rows if it has columns, then the message and plan."""
+    if not result.columns:
+        print(result.message + (f" ({result.plan})" if result.plan else ""), file=out)
+        return
+    cells = [[format_cell(value) for value in row] for row in result.rows]
+    widths = [max([len(name)] + [len(row[i]) for row in cells]) for i, name in enumerate(result.columns)]
+    print(" | ".join(name.ljust(width) for name, width in zip(result.columns, widths)).rstrip(), file=out)
+    print("-+-".join("-" * width for width in widths), file=out)
+    for row in cells:
+        print(" | ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip(), file=out)
+    note = f"{result.message}, {result.plan}" if result.plan else result.message
+    print(f"({note})", file=out)
+
+
+def run_sql(db, text, out=None):
+    """Run SQL text and print each Result. Returns an exit code: 0 ok, 2 error."""
+    if out is None:
+        out = sys.stdout
+    try:
+        for result in db.run(text):
+            print_result(result, out)
+    except (TypeError, ValueError) as e:
+        # SqlError, SchemaError and DatabaseError are all ValueErrors.
+        print(f"Error: {e}", file=out)
+        return 2
+    return 0
 
 
 def execute(table, query, out=None):
@@ -165,15 +230,34 @@ def run_command(table, words, out=None):
         return 2
 
 
-def repl(table):
-    """Interactive prompt that reads commands until 'exit' or Ctrl-D."""
-    print("tinydb interactive shell. Type 'help' for commands, 'exit' to quit.")
+def repl(table, directory):
+    """Interactive prompt that reads commands until 'exit' or Ctrl-D.
+
+    When input is piped in (python3 main.py < demo.sql) there are no prompts.
+    """
+    interactive = sys.stdin.isatty()
+    if interactive:
+        print("tinydb interactive shell. Type 'help' for commands, 'exit' to quit.")
+    db = None  # the SQL Database is only opened once it's needed
+    sql = ""  # SQL lines read so far, waiting for the ";" that ends the statement
     while True:
+        prompt = ("   ...> " if sql else "tinydb> ") if interactive else ""
         try:
-            line = input("tinydb> ")
+            line = input(prompt)
         except (EOFError, KeyboardInterrupt):
-            print()
+            if interactive:
+                print()
             break
+        if not sql and line.strip().startswith("--"):
+            continue  # a comment line
+        if sql or is_sql(line):
+            sql += line + "\n"
+            if sql.rstrip().endswith(";"):
+                db = db or open_database(directory)
+                if db is not None:
+                    run_sql(db, sql)
+                sql = ""
+            continue
         try:
             query = parser.parse_line(line)
         except QueryError as e:
@@ -187,6 +271,19 @@ def repl(table):
             execute(table, query)
         except (TypeError, ValueError) as e:
             print(f"Error: {e}")
+    if sql.strip():
+        db = db or open_database(directory)
+        if db is not None:
+            run_sql(db, sql)  # input ended without a final ";"
+
+
+def open_database(directory):
+    """Open the SQL Database, or print why it can't be opened and return None."""
+    try:
+        return Database(directory)
+    except (CorruptLogError, ValueError, KeyError, TypeError) as e:
+        print(f"Error: can't open the database in {directory!r}: {e}", file=sys.stderr)
+        return None
 
 
 def main(argv=None):
@@ -196,9 +293,17 @@ def main(argv=None):
         epilog=HELP_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    arg_parser.add_argument("--db", default="tinydb.jsonl", help="path to the database log file (default: tinydb.jsonl)")
-    arg_parser.add_argument("command", nargs=argparse.REMAINDER, help="command to run; omit to open the interactive prompt")
+    arg_parser.add_argument("--db", default="tinydb.jsonl", help="key-value log file (default: tinydb.jsonl)")
+    arg_parser.add_argument("--dir", default="tinydb_data", help="folder for SQL tables (default: tinydb_data)")
+    arg_parser.add_argument("command", nargs=argparse.REMAINDER, help="command or SQL to run; omit to open the interactive prompt")
     options = arg_parser.parse_args(argv)
+
+    text = " ".join(options.command)
+    if is_sql(text):
+        db = open_database(options.dir)
+        if db is None:
+            return 2
+        return run_sql(db, text)
 
     try:
         table = Table.open(options.db)
@@ -207,6 +312,6 @@ def main(argv=None):
         return 2
 
     if not options.command:
-        repl(table)
+        repl(table, options.dir)
         return 0
     return run_command(table, options.command)

@@ -8,6 +8,9 @@ Phase 3 adds indexes on fields inside the values, and three ways to search:
 find (field equals a value), find_range (field between two values) and
 sort_by. Each one uses an index when there is one that helps, and falls back
 to checking every record when there isn't. last_plan says which happened.
+
+Phase 4 opens tables with a WriteAheadLog instead of a plain Storage, and adds
+set_many and delete_many, which change many records in one transaction.
 """
 
 import os
@@ -15,7 +18,7 @@ import os
 from tinydb.algorithms import merge_sort
 from tinydb.index import MISSING, BTreeIndex, HashIndex, field_value, index_key
 from tinydb.record import Record
-from tinydb.storage import Storage
+from tinydb.wal import WriteAheadLog
 
 SET = "set"
 DELETE = "delete"
@@ -40,7 +43,7 @@ class Table:
     def open(cls, path):
         """Open the table stored at path. The file name becomes the table name."""
         name = os.path.splitext(os.path.basename(path))[0]
-        return cls(name, Storage(path))
+        return cls(name, WriteAheadLog(path))
 
     # ---- replaying the log ----
 
@@ -88,6 +91,28 @@ class Table:
         self.storage.append({"op": SET, **record.to_dict()})
         self._put(record)
         return record
+
+    def set_many(self, pairs):
+        """Create or overwrite many records in one all-or-nothing transaction.
+
+        pairs is a list of (key, value). Every record is checked before anything
+        is written, so one bad value means nothing changes. Needs a WriteAheadLog.
+        """
+        records = [Record(key, value) for key, value in pairs]
+        self.storage.append_transaction([{"op": SET, **record.to_dict()} for record in records])
+        for record in records:
+            self._put(record)
+        return records
+
+    def delete_many(self, keys):
+        """Remove many records in one transaction. Returns how many existed."""
+        for key in keys:
+            Record.check_key(key)
+        found = [key for key in dict.fromkeys(keys) if key in self._records]
+        self.storage.append_transaction([{"op": DELETE, "key": key} for key in found])
+        for key in found:
+            self._drop(key)
+        return len(found)
 
     def delete(self, key):
         """Remove a record. Returns True if it existed, False otherwise."""

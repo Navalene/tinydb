@@ -4,7 +4,7 @@ A tiny database engine built from scratch in pure Python, using only the standar
 
 ## Status
 
-**Phase 3: hash and B-tree indexes, sorting, and search**
+**Phase 4: tables, schemas, mini-SQL, and a write-ahead log**
 
 ## Quick start
 
@@ -42,6 +42,47 @@ python3 main.py unindex plan
 
 Every search prints how it ran, for example `(2 records, btree index on age)` or `(1 record, full scan)`.
 
+### SQL
+
+Anything that starts with a SQL word, or ends with `;`, is SQL. SQL tables live in the `tinydb_data/` folder (change it with `--dir`).
+
+```bash
+python3 main.py "CREATE TABLE clients (id INT PRIMARY KEY, name TEXT NOT NULL, plan TEXT, age INT);"
+python3 main.py "INSERT INTO clients VALUES (1, 'Ada', 'PPO', 70), (2, 'Bob', 'HMO', 66);"
+python3 main.py "SELECT name, age FROM clients WHERE age >= 65 ORDER BY age DESC;"
+```
+
+```
+name | age
+-----+----
+Ada  | 70
+Bob  | 66
+(2 rows, full scan + merge sort)
+```
+
+In the interactive prompt, a statement can span several lines and ends at `;`.
+
+| Statement | Example |
+|---|---|
+| `CREATE TABLE` | `CREATE TABLE plans (code TEXT PRIMARY KEY, premium FLOAT NOT NULL)` |
+| `DROP TABLE` | `DROP TABLE plans` |
+| `CREATE INDEX` | `CREATE INDEX ON clients (age)` (B-tree) or `CREATE INDEX ON clients USING HASH (plan)` |
+| `INSERT` | `INSERT INTO clients (id, name) VALUES (3, 'Cy'), (4, 'Di')` |
+| `SELECT` | `SELECT * FROM clients WHERE plan = 'PPO' AND age < 80 ORDER BY age LIMIT 10` |
+| `UPDATE` | `UPDATE clients SET plan = 'HMO' WHERE id = 1` |
+| `DELETE` | `DELETE FROM clients WHERE age < 65` |
+| `SHOW TABLES`, `DESCRIBE` | `DESCRIBE clients` |
+
+Types: `INT`, `FLOAT`, `TEXT`, `BOOL` (`TRUE`/`FALSE`), `DATE` (`'YYYY-MM-DD'`). Every table needs one `PRIMARY KEY` column (`INT`, `TEXT` or `DATE`). Columns can be `NOT NULL`. `WHERE` supports `=`, `!=` (or `<>`), `<`, `<=`, `>`, `>=` joined by `AND`. Text uses single quotes, and `''` is a quote inside text: `'O''Brien'`. `--` starts a comment.
+
+### Demo
+
+`demo.sql` builds a small Medicare dataset (plans, clients, enrollment periods), then answers questions like "which clients have a SEP deadline before the end of the year?" and shows the query plan change once an index exists:
+
+```bash
+rm -rf demo_data && python3 main.py --dir demo_data < demo.sql
+```
+
 ## Run the tests
 
 ```bash
@@ -62,6 +103,12 @@ tinydb/algorithms.py  binary search and merge sort, written by hand
 tinydb/hashtable.py   HashTable: a hash map with separate chaining and resizing
 tinydb/btree.py       BTree: a balanced B-tree with insert, delete and range reads
 tinydb/index.py       HashIndex and BTreeIndex on a field inside each value
+tinydb/schema.py      Column and Schema: column types, PRIMARY KEY, NOT NULL, row checks
+tinydb/wal.py         WriteAheadLog: Storage plus begin/commit transactions and crash recovery
+tinydb/lexer.py       splits SQL text into tokens
+tinydb/sql.py         SqlParser: recursive-descent parser, tokens into statement objects
+tinydb/database.py    Database: tables in a folder, runs statements, picks a query plan
+demo.sql              Medicare demo script
 tests/                one test file per module, plus test_cli.py
 ```
 
@@ -97,7 +144,7 @@ typed text --> QueryParser --> Query --> cli.execute() --> Table --> Storage -->
 - **Record** is a small frozen dataclass (`key`, `value`). It checks its own key and value when it's created, so every other class can trust it.
 - **Storage** only reads and writes lines of JSON. It doesn't know what "set" or "delete" mean. `replay(apply)` hands each entry to a function the Table passes in, which is the same recovery loop a write-ahead log uses.
 - **Table** holds Records in a dict for O(1) reads and turns changes into log entries. It's given a Storage instead of building one inside itself (**dependency injection**), so a test or a future WAL can swap in a different one.
-- **QueryParser** turns words into a `Query` object and never touches data. Executing a Query is a separate step. Phase 4's mini-SQL parser will produce Query objects the same way.
+- **QueryParser** turns words into a `Query` object and never touches data. Executing a Query is a separate step. Phase 4's SQL parser keeps the same split: it builds statement objects, and the Database runs them.
 
 The file format didn't change, so a Phase 1 `tinydb.jsonl` still opens.
 
@@ -118,6 +165,25 @@ Phase 2 could only find a record by its key. Finding "every client on a PPO plan
 - **Comparing mixed JSON values.** One field can hold a number in one record and text in another, and Python can't compare `70 < "seventy"`. `index_key` turns each value into a `(type rank, value)` tuple, so null < booleans < numbers < strings < lists < objects. The same key is used for hashing, so both index types and the full scan agree on what "equal" means.
 - **Indexes are saved in the log, but not their contents.** `index age btree` appends `{"op": "index", "field": "age", "kind": "btree"}`, and `unindex` appends `{"op": "drop_index", ...}`. On startup, replay rebuilds each index from the records. Compaction writes index lines first. `set` and `delete` lines didn't change, so a Phase 1 or 2 log still opens.
 - **The cost of an index.** Every `set` and `delete` updates every index too, and each index uses memory. Indexes speed up reads and slow down writes, which is why you index the fields you search on, not all of them.
+
+## Phase 4 design: SQL on top of the same engine
+
+Phase 4 adds a SQL layer without replacing anything underneath it:
+
+```
+SQL text --> lexer --> parser --> statement --> Database.execute() --> Result
+                                                   |            |
+                                                 Schema       Table --> WriteAheadLog --> clients.jsonl
+```
+
+- **Rows are records.** A row is stored as a Record whose key is the primary key (as text) and whose value is a dict of its columns. NULL columns are left out. That's the shape Phase 3 already indexes and searches, so `WHERE`, `ORDER BY` and `CREATE INDEX` reuse `find`, `find_range`, `create_index` and merge sort.
+- **Schemas are checked on write.** `CREATE TABLE` saves a schema, and every `INSERT` and `UPDATE` checks types, `NOT NULL` and primary-key uniqueness before anything is written. A FLOAT column turns `25` into `25.0`, and a DATE must be a real ISO date, so values in one column always compare cleanly.
+- **One folder, one log per table.** `tinydb_data/_catalog.jsonl` is a log of `create_table` and `drop_table` entries, replayed on startup like every other log. Each table has its own `<name>.jsonl`. Table and column names may only use `a-z`, `0-9` and `_`, so a name can't escape the folder (no path traversal).
+- **Lexer, then parser.** The lexer turns text into typed tokens. Anything in single quotes is always one STRING token, so data can never be read as SQL, which is the basis of injection-safe parsing. The parser is recursive descent (one method per grammar rule) and produces frozen statement objects. It never touches data, so the coming HTTP API can reuse it. A script is fully parsed before any statement runs.
+- **A small query planner.** For each `WHERE`, the planner picks one access path, fastest first: primary-key lookup (a dict), a hash or B-tree index for `=`, a B-tree index for `<`, `<=`, `>`, `>=`, or a full scan. Then every condition is rechecked on the candidates. The chosen plan is printed after each result, like `EXPLAIN`. `NULL` never matches a comparison, as in standard SQL, and `ORDER BY` puts NULLs last (first with `DESC`).
+- **Write-ahead log.** Every change is logged and fsynced before memory changes. A statement that writes several rows (multi-row `INSERT`, `UPDATE`, `DELETE`) is written as one transaction: a `begin` line, the changes, and a `commit` line, with one fsync (group commit). On startup only committed transactions are replayed, and an unfinished one at the end of the log is rolled back and trimmed. That makes each statement atomic. Lines outside a transaction still count on their own, so Phase 1 to 3 logs open unchanged. Compaction rewrites the log without transaction markers, acting as a checkpoint.
+
+**Trade-offs and limits:** no joins, `OR`, `GROUP BY` or multi-statement transactions yet; one primary-key column per table; every table still lives in memory. Each statement is atomic, but a script of several statements is not.
 
 ## Roadmap
 

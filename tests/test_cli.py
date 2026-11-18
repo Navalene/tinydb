@@ -6,10 +6,12 @@ Run from the project root: python3 -m unittest discover -s tests -t .
 import io
 import os
 import tempfile
+import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
-from tinydb.cli import main, run_command
+from tinydb.cli import is_sql, main, run_command, run_sql
+from tinydb.database import Database
 from tinydb.table import Table
 
 
@@ -137,6 +139,81 @@ class CliTests(unittest.TestCase):
             main(["--db", self.path, "index", "plan"])
             main(["--db", self.path, "find", "plan", "PPO"])
         self.assertTrue(out.getvalue().endswith("(1 record, hash index on plan)\n"))
+
+
+class SqlCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="tinydb-test-")
+        self.dir = os.path.join(self.tmpdir.name, "data")
+        self.kv_path = os.path.join(self.tmpdir.name, "kv.jsonl")
+        self.db = Database(self.dir)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def sql(self, text):
+        out = io.StringIO()
+        code = run_sql(self.db, text, out)
+        return code, out.getvalue().rstrip("\n")
+
+    def piped(self, text):
+        """Run the interactive prompt with text piped in, like python3 main.py < file.sql."""
+        stdin = sys.stdin
+        sys.stdin = io.StringIO(text)
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                main(["--db", self.kv_path, "--dir", self.dir])
+        finally:
+            sys.stdin = stdin
+        return out.getvalue()
+
+    def test_is_sql(self):
+        for text in ("SELECT * FROM clients", "select 1", "DELETE FROM clients", "anything;", "SHOW TABLES"):
+            self.assertTrue(is_sql(text), text)
+        for text in ("set name Ada", "delete name", "find plan PPO", ""):
+            self.assertFalse(is_sql(text), text)
+
+    def test_messages(self):
+        self.assertEqual(self.sql("CREATE TABLE t (id INT PRIMARY KEY);"), (0, "Created table t"))
+        self.assertEqual(self.sql("INSERT INTO t VALUES (1), (2);"), (0, "Inserted 2 rows"))
+        self.assertEqual(self.sql("DELETE FROM t WHERE id = 1;"), (0, "Deleted 1 row (primary key lookup)"))
+
+    def test_select_prints_a_table(self):
+        self.sql("CREATE TABLE clients (id INT PRIMARY KEY, name TEXT, active BOOL);")
+        self.sql("INSERT INTO clients VALUES (1, 'Ada', TRUE), (22, NULL, FALSE);")
+        self.assertEqual(self.sql("SELECT * FROM clients;"), (0, "\n".join([
+            "id | name | active",
+            "---+------+-------",
+            "1  | Ada  | true",
+            "22 | NULL | false",
+            "(2 rows, full scan)",
+        ])))
+
+    def test_errors_print_and_return_2(self):
+        self.assertEqual(self.sql("SELECT * FROM nope;"), (2, "Error: No table named nope"))
+        self.assertEqual(self.sql("SELEC * FROM nope;")[0], 2)
+
+    def test_main_one_shot_sql(self):
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main(["--dir", self.dir, "CREATE TABLE t (id INT PRIMARY KEY);"]), 0)
+            self.assertEqual(main(["--dir", self.dir, "SELECT", "*", "FROM", "t;"]), 0)
+        self.assertEqual(out.getvalue(), "Created table t\nid\n--\n(0 rows, full scan)\n")
+
+    def test_piped_script_mixes_sql_comments_and_key_value_commands(self):
+        output = self.piped(
+            "-- a comment\n"
+            "CREATE TABLE t (id INT PRIMARY KEY,\n"
+            "                name TEXT);\n"
+            "INSERT INTO t VALUES (1, 'Ada');\n"
+            "set greeting hi\n"
+            "get greeting\n"
+            "SELECT name FROM t\n"
+        )
+        self.assertEqual(output, "Created table t\nInserted 1 row\nOK\nhi\nname\n----\nAda\n(1 row, full scan)\n")
+
+    def test_bad_sql_in_the_prompt_does_not_stop_it(self):
+        output = self.piped("SELECT * FROM nope;\nset a 1\n")
+        self.assertEqual(output, "Error: No table named nope\nOK\n")
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,3 +4,5 @@ __pycache__/
 .vscode/
 *.jsonl
 .tinydb-*.tmp
+tinydb_data/
+demo_data/
