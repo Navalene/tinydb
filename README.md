@@ -4,7 +4,7 @@ A tiny database engine built from scratch in pure Python, using only the standar
 
 ## Status
 
-**Phase 5: requirements, architecture and API spec.** The engine is complete through Phase 4 (tables, schemas, mini-SQL, write-ahead log). Phase 5 designs the HTTP API, which Phase 6 builds.
+**Phase 6: a secure HTTP API.** The engine (tables, schemas, mini-SQL, write-ahead log) is served over HTTP with the `QUERY` method, protected by read-only and read-write API keys, hardened against malformed and malicious requests, and can encrypt its files on disk. 458 tests.
 
 ## Quick start
 
@@ -83,6 +83,52 @@ Types: `INT`, `FLOAT`, `TEXT`, `BOOL` (`TRUE`/`FALSE`), `DATE` (`'YYYY-MM-DD'`).
 rm -rf demo_data && python3 main.py --dir demo_data < demo.sql
 ```
 
+### HTTP API
+
+Make a key, start the server, and send SQL with `curl`. Reads use the HTTP `QUERY` method and writes use `POST`:
+
+```bash
+python3 main.py --dir demo_data apikey create dashboard --role read    # prints the key once
+python3 main.py --dir demo_data serve                                  # http://127.0.0.1:8000
+```
+
+In a second Terminal, with the key in `READ_KEY`:
+
+```bash
+curl -X QUERY http://127.0.0.1:8000/query \
+  -H "Authorization: Bearer $READ_KEY" \
+  -H "Content-Type: application/sql" \
+  --data-binary "SELECT client_id, reason, deadline FROM enrollment_periods
+                 WHERE period = 'SEP' AND deadline >= '2026-11-18' ORDER BY deadline;"
+```
+
+```json
+{"results": [{"message": "2 rows", "columns": ["client_id", "reason", "deadline"],
+  "rows": [[2, "Has Medicaid", "2026-12-15"], [5, "Moved to a new ZIP code", "2026-12-31"]],
+  "plan": "btree index on deadline + merge sort"}]}
+```
+
+| Command | What it does |
+|---|---|
+| `python3 main.py serve [--port 8000] [--host 127.0.0.1]` | Run the API on the `--dir` folder |
+| `python3 main.py apikey create NAME --role read\|write` | Make a key. Read keys only work with `QUERY /query`. |
+| `python3 main.py apikey list` | List keys by id, role and name (never the key) |
+| `python3 main.py apikey revoke ID` | Delete a key. It stops working right away, even while the server runs. |
+
+`GET /health` and `OPTIONS` need no key. Everything else is in [docs/api-spec.md](docs/api-spec.md).
+
+### Encryption at rest
+
+Set a passphrase before creating a **new** folder, and every log file in it is encrypted:
+
+```bash
+export TINYDB_PASSPHRASE='a long passphrase you will remember'
+python3 main.py --dir secure_demo < demo.sql
+python3 main.py --dir secure_demo serve
+```
+
+The files then hold only base64 lines. Opening the folder later needs the same passphrase, from the variable or a hidden prompt. A wrong one is refused before any file is read. An existing plain folder can't be switched to encrypted: load its data into a new folder instead. The key-value store (`--db`) is not encrypted.
+
 ## Design documents
 
 | Document | What it covers |
@@ -116,10 +162,13 @@ tinydb/schema.py      Column and Schema: column types, PRIMARY KEY, NOT NULL, ro
 tinydb/wal.py         WriteAheadLog: Storage plus begin/commit transactions and crash recovery
 tinydb/lexer.py       splits SQL text into tokens
 tinydb/sql.py         SqlParser: recursive-descent parser, tokens into statement objects
-tinydb/database.py    Database: tables in a folder, runs statements, picks a query plan
+tinydb/database.py    Database: tables in a folder, runs statements, picks a query plan, opens encrypted folders
+tinydb/server.py      ApiServer: the HTTP API on http.server (QUERY /query, POST /execute), limits, JSON
+tinydb/auth.py        KeyStore: API keys stored as hashes, with read and write roles
+tinydb/crypto.py      Cipher: encryption at rest from HMAC-SHA256 and PBKDF2
 demo.sql              Medicare demo script
 docs/                 requirements, architecture and API spec
-tests/                one test file per module, plus test_cli.py
+tests/                one test file per module, plus test_cli.py and test_security.py
 ```
 
 ## Phase 1 design: an append-only log
@@ -203,6 +252,25 @@ Phase 5 is design work, written before the server exists:
 - **Diagrams as code.** The architecture diagrams are Mermaid text, so GitHub draws them and they change in the same commits as the code.
 - **Reads use HTTP QUERY.** `QUERY` became a standard in June 2026 ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008)). It's safe and idempotent like `GET`, but the SQL goes in the request body instead of the URL. Because a QUERY must never change data, the server parses the whole body first and refuses it if any statement writes. Writes use `POST /execute`, so the method alone tells clients and caches whether a request changes data.
 - **Built on what exists.** The server will call the same `parse` and `Database.execute` as the shell and turn each `Result` into JSON. Nothing below the server changes.
+
+## Phase 6 design: a secure HTTP API
+
+Phase 6 builds the API that Phase 5 designed, then attacks it:
+
+```
+curl --> http.server --> ApiHandler: path --> method --> API key --> role --> headers --> body
+                                                                                          |
+                              JSON <-- Result <-- Database.execute <-- check every statement <-- parse
+```
+
+- **Hand-built on `http.server`.** It calls `do_QUERY` for a `QUERY` request, so the method needs no special support. Routing, body checks and JSON are written by hand, and every refusal is an `ApiError` that becomes one JSON error shape. `ThreadingHTTPServer` handles connections on threads, and one lock lets one request at a time use the Database.
+- **QUERY is really safe.** The whole body is parsed and every statement checked before the first one runs, so `SELECT ...; DELETE ...;` sent with `QUERY` changes nothing.
+- **Authentication and authorization.** API keys are 256-bit random tokens from `secrets`. Only their SHA-256 hashes are stored, so a copied keys file is useless. Plain SHA-256 is enough because the keys are random, unlike passwords. Keys are compared with `hmac.compare_digest`, and the loop never stops early. A `read` key gets `403` on `POST /execute`, so a dashboard can never change a record (least privilege). The key is checked before the body is read, and the log names the key id behind each request.
+- **Hardening found a real bug.** `rfile.read(n)` returns whatever arrived, so a dropped connection turned `DELETE FROM clients WHERE id = 5` into `DELETE FROM clients`. Now a short body runs nothing. `test_security.py` has 28 attacks, and 15 of them broke the server before the fixes: slowloris (10-second timeouts), connection floods (32 slots, then `503`), request smuggling (two `Content-Length`s), huge numbers, infinite FLOATs, overlong names, 40,000 statements in one body, terminal escapes in log lines, and a `Server` header that named the Python version. The SQL injection attacks already failed, because the Phase 4 lexer never reads quoted text as SQL.
+- **Encryption at rest from the standard library.** Python has no AES built in, so `crypto.py` uses PBKDF2 (600,000 rounds, random salt) to make an encryption key and a MAC key, XORs each line with an HMAC-SHA256 keystream (counter mode), and seals it with an HMAC tag (encrypt-then-MAC). The tag also covers the file name, so lines can't be moved between tables. A real product should use AES-GCM from a reviewed library. This is a learning build, and it says so.
+- **Encryption in one place.** Only `Storage` reads and writes lines, so encryption is two methods there, and the WAL, tables, indexes and SQL didn't change. A torn encrypted line fails to decrypt, `DecryptionError` is a `ValueError`, and the existing recovery code trims it. A check value in `_crypto.json` refuses a wrong passphrase **before** replay, so recovery can't mistake a wrong key for a torn write and trim real data.
+
+**Trade-offs and limits:** no HTTPS in the server itself (use a proxy before leaving `127.0.0.1`), no rate limiting of failed keys, and no parameterized queries yet. Someone who can write the files can still drop the newest line, roll back the folder, or reorder lines in a file. Line counts, line lengths and table names still show.
 
 ## Roadmap
 

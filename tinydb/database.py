@@ -13,14 +13,26 @@ WHERE, ORDER BY and CREATE INDEX are built on find, find_range and create_index.
 The parser says what to do. Database.execute decides how to do it (the
 "query plan") and returns a Result. It never prints, so the shell and the
 HTTP API can show the same Result in their own way.
+
+Encryption at rest (Phase 6): Database(directory, passphrase="...") encrypts
+every log in the folder. The first time, it writes _crypto.json with the salt
+and a "check" value. Every later open must give the same passphrase, and a
+wrong one is refused before any log is read, so nothing is ever trimmed by
+mistake.
 """
 
+import base64
+import getpass
+import json
 import operator
 import os
+import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Tuple
 
 from tinydb.algorithms import merge_sort
+from tinydb.crypto import ITERATIONS, Cipher, DecryptionError, make_salt
 from tinydb.schema import Schema, check_name
 from tinydb.sql import (
     Condition,
@@ -39,6 +51,9 @@ from tinydb.table import Table
 from tinydb.wal import WriteAheadLog
 
 CATALOG = "_catalog.jsonl"
+CRYPTO_FILE = "_crypto.json"
+CHECK_TEXT = "tinydb"  # encrypted into _crypto.json, so a wrong passphrase is caught right away
+PASSPHRASE_VARIABLE = "TINYDB_PASSPHRASE"
 CREATE_TABLE = "create_table"
 DROP_TABLE = "drop_table"
 
@@ -66,6 +81,71 @@ class Result:
     plan: str = ""  # how the rows were found, like "btree index on age"
 
 
+def is_encrypted(directory):
+    """True if directory holds an encrypted database."""
+    return os.path.exists(os.path.join(directory, CRYPTO_FILE))
+
+
+def passphrase_for(directory, environ=None, ask=None):
+    """The passphrase to open directory with, or None for a plain database.
+
+    It comes from the TINYDB_PASSPHRASE environment variable. If that isn't set,
+    the folder is encrypted, and someone is typing at a Terminal, it's asked for
+    with a hidden prompt (nothing shows as you type). environ and ask are for tests.
+    """
+    environ = os.environ if environ is None else environ
+    passphrase = environ.get(PASSPHRASE_VARIABLE) or None
+    if passphrase is None and is_encrypted(directory):
+        if ask is None and sys.stdin.isatty():
+            ask = getpass.getpass
+        if ask is not None:
+            passphrase = ask(f"Passphrase for {directory}: ") or None
+    return passphrase
+
+
+def open_cipher(directory, passphrase, iterations=ITERATIONS):
+    """Return the Cipher for a database folder, or None if it isn't encrypted.
+
+    Refuses to mix: an encrypted folder needs the passphrase, and a folder that
+    already holds plain data can't be opened with one.
+    """
+    path = os.path.join(directory, CRYPTO_FILE)
+    if not is_encrypted(directory):
+        if passphrase is None:
+            return None  # a plain folder, like before Phase 6
+        if os.path.exists(os.path.join(directory, CATALOG)):
+            raise DatabaseError(f"{directory} already holds unencrypted data. Use a new folder for an encrypted database")
+        os.makedirs(directory, exist_ok=True)
+        salt = make_salt()
+        cipher = Cipher.from_passphrase(passphrase, salt, iterations)
+        settings = {
+            "kdf": "pbkdf2-hmac-sha256",
+            "iterations": iterations,
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "check": cipher.encrypt_text(CHECK_TEXT, CRYPTO_FILE.encode()),
+        }
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tinydb-", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)  # all or nothing, like Storage.rewrite
+        return cipher
+
+    if passphrase is None:
+        raise DatabaseError(f"{directory} is encrypted. Set TINYDB_PASSPHRASE to its passphrase")
+    with open(path, encoding="utf-8") as f:
+        settings = json.load(f)
+    cipher = Cipher.from_passphrase(passphrase, base64.b64decode(settings["salt"]), settings["iterations"])
+    try:
+        if cipher.decrypt_text(settings["check"], CRYPTO_FILE.encode()) != CHECK_TEXT:
+            raise DecryptionError("check value doesn't match")
+    except DecryptionError:
+        raise DatabaseError(f"Wrong passphrase for {directory}") from None
+    return cipher
+
+
 def plural(count, noun):
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
@@ -81,14 +161,23 @@ def matches(row, condition):
 class Database:
     """A folder of tables. Open it, then call run("SELECT ...") or execute(statement)."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, passphrase=None, iterations=ITERATIONS):
+        """Open (or start) the database in directory. Give a passphrase to encrypt it.
+
+        iterations is only used when a new encrypted folder is made. The tests pass a small number.
+        """
         self.directory = directory
         self._schemas = {}  # table name -> Schema
         self._tables = {}  # table name -> Table
-        self._catalog = WriteAheadLog(os.path.join(directory, CATALOG))
+        self._cipher = open_cipher(directory, passphrase, iterations)  # checked before any log is read
+        self._catalog = WriteAheadLog(os.path.join(directory, CATALOG), self._cipher)
         self._catalog.replay(self._apply_catalog)
         for name in self._schemas:
-            self._tables[name] = Table(name, WriteAheadLog(self._path(name)))
+            self._tables[name] = Table(name, WriteAheadLog(self._path(name), self._cipher))
+
+    @property
+    def encrypted(self):
+        return self._cipher is not None
 
     def _apply_catalog(self, entry):
         """Apply one catalog log entry. Raises if the entry is invalid."""
@@ -119,7 +208,7 @@ class Database:
             os.remove(path)  # left over from a dropped table, if a crash hit before it was deleted
         self._catalog.append({"op": CREATE_TABLE, "table": name, "schema": schema.to_dict()})
         self._schemas[name] = schema
-        self._tables[name] = Table(name, WriteAheadLog(path))
+        self._tables[name] = Table(name, WriteAheadLog(path, self._cipher))
 
     def drop_table(self, name):
         """Remove a table and all of its rows."""

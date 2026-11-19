@@ -6,3 +6,5 @@ __pycache__/
 .tinydb-*.tmp
 tinydb_data/
 demo_data/
+secure_data/
+secure_demo/

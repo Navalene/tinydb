@@ -1,13 +1,14 @@
 # tinydb HTTP API, as an OpenAPI 3.2 description.
-# The human-readable version is api-spec.md. Built in Phase 6.
+# The human-readable version is api-spec.md. Built in Phase 6 (tinydb/server.py).
 openapi: 3.2.0
 info:
   title: tinydb HTTP API
-  version: 0.5.0
+  version: 0.6.0
   description: >
     Mini-SQL over HTTP. Reads use the QUERY method (RFC 10008) on /query.
     Writes use POST on /execute. The method tells you whether a request
-    can change data.
+    can change data. Every request except GET /health and OPTIONS needs an
+    API key: a read key may use /query, a write key may use both paths.
 servers:
   - url: http://127.0.0.1:8000
     description: Local server (listens on this computer only)
@@ -48,12 +49,16 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "408":
+          $ref: "#/components/responses/Error"
         "411":
           $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Busy"
     options:
       summary: Methods and body formats /query accepts
       operationId: queryOptions
@@ -77,6 +82,7 @@ paths:
         Each statement is atomic. Several statements run in order and stop at
         the first error; earlier ones stay saved and are listed in results.
         A read statement is refused with WrongMethod before anything runs.
+        Needs a write key; a read key gets 403.
       operationId: runExecute
       requestBody:
         $ref: "#/components/requestBodies/Sql"
@@ -97,12 +103,18 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/Error"
         "411":
           $ref: "#/components/responses/Error"
         "413":
           $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Busy"
     options:
       summary: Methods /execute accepts
       operationId: executeOptions
@@ -142,7 +154,10 @@ components:
     apiKey:
       type: http
       scheme: bearer
-      description: "An API key, sent as Authorization: Bearer <key>. Added in Phase 6."
+      description: >
+        An API key, sent as Authorization: Bearer <key>. Make one with
+        python3 main.py apikey create NAME --role read|write. Read keys may
+        only use QUERY /query.
 
   headers:
     AcceptQuery:
@@ -154,7 +169,9 @@ components:
   requestBodies:
     Sql:
       required: true
-      description: One or more SQL statements separated by semicolons. At most 1 MB.
+      description: >
+        One to 100 SQL statements separated by semicolons, at most 1 MB, sent
+        with exactly one Content-Length. A body that arrives short runs nothing.
       content:
         application/sql:
           schema:
@@ -208,8 +225,9 @@ components:
             type:
               type: string
               enum: [SqlError, SchemaError, DatabaseError, WrongMethod, EmptyRequest,
-                     BadRequest, Unauthorized, NotFound, MethodNotAllowed,
-                     LengthRequired, TooLarge, UnsupportedMediaType, InternalError]
+                     BadRequest, Unauthorized, Forbidden, NotFound, MethodNotAllowed,
+                     Timeout, LengthRequired, TooLarge, UnsupportedMediaType,
+                     InternalError, Busy]
             message:
               type: string
         results:
@@ -236,12 +254,33 @@ components:
               type: WrongMethod
               message: DELETE changes data, so send it with POST /execute. Nothing was run.
     Unauthorized:
-      description: Missing or wrong API key (Phase 6)
+      description: Missing, wrong or revoked API key
       headers:
         WWW-Authenticate:
           schema:
             type: string
-            example: Bearer
+            example: Bearer realm="tinydb", error="invalid_token"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: A read key was used with POST /execute. Nothing ran.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              type: Forbidden
+              message: Key 3f9a1c2e is read-only, so it can't use POST /execute.
+    Busy:
+      description: Too many connections are open. Try again after Retry-After seconds.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            example: 1
       content:
         application/json:
           schema:

@@ -3,15 +3,15 @@
 | | |
 |---|---|
 | **Document** | Software requirements specification |
-| **Version** | 0.5 (Phase 5) |
-| **Date** | 2026-11-18 |
-| **Status** | Phases 1 to 4 built and tested (307 tests). HTTP API and security planned. |
+| **Version** | 0.6 (Phase 6) |
+| **Date** | 2026-11-19 |
+| **Status** | Phases 1 to 6 built and tested (458 tests), including the HTTP API, API keys and encryption at rest. |
 
 ## 1. Purpose and scope
 
 tinydb is a small database engine written from scratch in pure Python. It stores data in an append-only log, rebuilds its state from that log on startup, indexes data with a hand-built hash table and B-tree, and runs a mini-SQL language with typed tables and atomic writes.
 
-This document says **what** tinydb must do and **how well**, so every feature can be checked against a test. It covers the parts that exist (Phases 1 to 4) and the HTTP API and security work that comes next (Phase 6). [architecture.md](architecture.md) explains how it is built, and [api-spec.md](api-spec.md) defines the HTTP API.
+This document says **what** tinydb must do and **how well**, so every feature can be checked against a test. It covers the engine (Phases 1 to 4) and the HTTP API and its security (Phase 6). [architecture.md](architecture.md) explains how it is built, and [api-spec.md](api-spec.md) defines the HTTP API.
 
 ## 2. Users
 
@@ -34,9 +34,11 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 
 **UC-5 Recover after a crash.** The power fails in the middle of a write. On the next start, every committed change is there, and the half-written change is gone as if it never started.
 
-**UC-6 Query over HTTP** (planned). An application sends `SELECT` SQL in the body of an HTTP `QUERY` request and gets the rows back as JSON.
+**UC-6 Query over HTTP.** An application with a read-only API key sends `SELECT` SQL in the body of an HTTP `QUERY` request and gets the rows back as JSON.
 
-**UC-7 Change data over HTTP** (planned). An application sends `INSERT`, `UPDATE` or `DELETE` SQL with `POST` and gets back a message such as `Inserted 3 rows`.
+**UC-7 Change data over HTTP.** An application with a read-write API key sends `INSERT`, `UPDATE` or `DELETE` SQL with `POST` and gets back a message such as `Inserted 3 rows`.
+
+**UC-8 Keep client data private on disk.** The agent's laptop is lost. The database folder was opened with a passphrase, so the files hold no readable names, birth dates or Medicaid status, and they can't be opened without the passphrase.
 
 ## 4. Functional requirements
 
@@ -95,7 +97,7 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 | FR-22 | Must run one command from the command line, or an interactive `tinydb>` prompt. | 1 | `test_cli.py` |
 | FR-23 | Must run SQL typed at the prompt, passed as an argument, or piped in from a file. | 4 | `test_cli.py` |
 
-### 4.7 HTTP API (planned, Phase 6)
+### 4.7 HTTP API
 
 | ID | Requirement | Phase | Checked by |
 |---|---|---|---|
@@ -103,7 +105,20 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 | FR-25 | Must refuse any statement that changes data inside a `QUERY` request, because `QUERY` is a safe method. | 6 | `test_server.py` |
 | FR-26 | Must accept write SQL with `POST`, and refuse read statements there. | 6 | `test_server.py` |
 | FR-27 | Must return errors as JSON with a matching HTTP status code. | 6 | `test_server.py` |
-| FR-28 | Must require an API key on every request except the health check. | 6 | `test_server.py` |
+| FR-28 | Must require an API key on every request except the health check and `OPTIONS`. | 6 | `test_server.py` |
+| FR-29 | Must give each key a role: `read` keys may only use `QUERY /query`, and `write` keys may also use `POST /execute`. | 6 | `test_server.py` |
+| FR-30 | Must store only a hash of each key, show the key once when it's made, and let a key be revoked while the server runs. | 6 | `test_auth.py` |
+| FR-31 | Must run nothing from a request whose body is cut short, sent too slowly, too large, or has an ambiguous length. | 6 | `test_security.py` |
+| FR-32 | Must limit statements per request, open connections, name length and number size. | 6 | `test_security.py` |
+
+### 4.8 Encryption at rest
+
+| ID | Requirement | Phase | Checked by |
+|---|---|---|---|
+| FR-33 | Must encrypt every log line in a folder opened with a passphrase, including the catalog and transaction markers. | 6 | `test_encryption.py` |
+| FR-34 | Must detect any change to an encrypted line, and a line moved from another table's file. | 6 | `test_crypto.py`, `test_encryption.py` |
+| FR-35 | Must refuse a wrong or missing passphrase before reading any log, and change no file. | 6 | `test_encryption.py` |
+| FR-36 | Must read the passphrase from `TINYDB_PASSPHRASE` or a hidden prompt, never from a command-line argument. | 6 | `test_cli.py` |
 
 ## 5. Non-functional requirements
 
@@ -115,10 +130,11 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 | NFR-4 | Portability | Runs on Python 3.8 or newer on macOS and Linux, with only the standard library. |
 | NFR-5 | Security | Table and column names may only use `a-z`, `0-9` and `_`, so a name can't become a path outside the data folder. |
 | NFR-6 | Security | Quoted text is always data and never SQL, so input can't change what a statement does (no SQL injection). |
-| NFR-7 | Security (planned) | The server listens on `127.0.0.1` by default, limits the request body size, and checks API keys (Phase 6). |
+| NFR-7 | Security | The server listens on `127.0.0.1` by default, never sends a traceback or its Python version, and sends `nosniff` and `Content-Security-Policy` headers. |
 | NFR-8 | Maintainability | One module per job, one test file per module, and 0 problems in VS Code (Pylance). |
 | NFR-9 | Testability | The engine never prints. It returns Result objects, so it can be tested without capturing output. |
 | NFR-10 | Usability | Every error says what went wrong in plain words, such as `Column age is INT, so it can't hold 'old'`. |
+| NFR-11 | Security | Secrets are compared in constant time (`hmac.compare_digest`), and random values come from `secrets`, never `random`. |
 
 ## 6. Constraints
 
@@ -129,7 +145,7 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 
 ## 7. Out of scope
 
-Joins, `OR`, `GROUP BY` and aggregate functions, transactions that span several statements, replication, and user accounts with roles. These are good next steps, but tinydb doesn't need them to meet its goals.
+Joins, `OR`, `GROUP BY` and aggregate functions, parameterized queries (`?` placeholders), transactions that span several statements, replication, HTTPS in the server itself (use a proxy), and user accounts beyond API keys. These are good next steps, but tinydb doesn't need them to meet its goals.
 
 ## 8. Glossary
 
@@ -143,4 +159,6 @@ Joins, `OR`, `GROUP BY` and aggregate functions, transactions that span several 
 | WAL | Write-ahead log: changes are logged before they are applied, so they can be recovered. |
 | Atomic | All or nothing: a statement's changes are saved together, or none are. |
 | Safe method | An HTTP method that only reads, so a client can repeat or cache it. `GET` and `QUERY` are safe. `POST` is not. |
+| API key | A long random secret that a program sends with each request to prove it's allowed in. |
+| Encryption at rest | Data is encrypted in the files on disk, so a copy of the files can't be read without the key. |
 | SEP | Special Enrollment Period: a Medicare window, with a deadline, for changing plans after a life event. |

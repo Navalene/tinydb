@@ -30,6 +30,7 @@ KEYWORDS = {
     "PRIMARY", "SELECT", "SET", "SHOW", "TABLE", "TABLES", "TRUE", "UPDATE", "USING",
     "VALUES", "WHERE",
 }
+MAX_NUMBER_LENGTH = 30  # digits; far more than any real value, and stops numbers too big to handle
 SYMBOLS = ("<=", ">=", "!=", "<>", "(", ")", ",", ";", "*", "=", "<", ">")  # two-character ones first
 WORD_START = string.ascii_letters + "_"
 WORD_CHARS = WORD_START + string.digits
@@ -101,6 +102,9 @@ def tokenize(text):
 
 def read_number(raw, position):
     """Turn number text into an int, or a float if it has a decimal point."""
+    if len(raw) > MAX_NUMBER_LENGTH:
+        # A 500,000-digit number is valid Python, but slow to convert and print: a cheap way to stall a server.
+        raise SqlError(f"Number at position {position} is too long (over {MAX_NUMBER_LENGTH} characters)")
     try:
         return float(raw) if "." in raw else int(raw)
     except ValueError:

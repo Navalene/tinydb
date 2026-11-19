@@ -22,9 +22,11 @@ recovers like this:
 - If the log ends before the commit, the crash hit in the middle of the
   transaction. Those lines are thrown away and trimmed off the file, as if
   the transaction never started.
+
+Encryption (Phase 6) comes from Storage: pass a Cipher and every line,
+begin and commit included, is encrypted.
 """
 
-import json
 import os
 
 from tinydb.storage import CorruptLogError, Storage
@@ -36,8 +38,8 @@ COMMIT = "commit"
 class WriteAheadLog(Storage):
     """A Storage log that can also write and recover transactions."""
 
-    def __init__(self, path):
-        super().__init__(path)
+    def __init__(self, path, cipher=None):
+        super().__init__(path, cipher)
         self.next_tx = 1  # number for the next transaction, so begin and commit can be matched
 
     def replay(self, apply):
@@ -70,7 +72,7 @@ class WriteAheadLog(Storage):
                 continue
             last = number == len(complete)
             try:
-                entry = json.loads(line.decode("utf-8"))
+                entry = self.decode(line)
                 if not isinstance(entry, dict):
                     raise ValueError("entry is not a JSON object")
                 op = entry.get("op")
@@ -127,7 +129,7 @@ class WriteAheadLog(Storage):
         tx = self.next_tx
         self.next_tx += 1
         lines = [{"op": BEGIN, "tx": tx}] + entries + [{"op": COMMIT, "tx": tx}]
-        text = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in lines)
+        text = "".join(self.encode(entry) + "\n" for entry in lines)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(text)
             f.flush()

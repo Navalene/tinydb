@@ -9,14 +9,25 @@ import tempfile
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
+from tinydb.auth import KeyStore
 from tinydb.cli import is_sql, main, run_command, run_sql
-from tinydb.database import Database
+from tinydb.database import PASSPHRASE_VARIABLE, Database, passphrase_for
 from tinydb.table import Table
+
+
+def forget_passphrase(test):
+    """Hide TINYDB_PASSPHRASE from main() for one test, in case it's set in your Terminal."""
+    patcher = mock.patch.dict(os.environ)
+    patcher.start()
+    test.addCleanup(patcher.stop)  # puts os.environ back the way it was after the test
+    os.environ.pop(PASSPHRASE_VARIABLE, None)
 
 
 class CliTests(unittest.TestCase):
     def setUp(self):
+        forget_passphrase(self)
         self.tmpdir = tempfile.TemporaryDirectory(prefix="tinydb-test-")
         self.path = os.path.join(self.tmpdir.name, "cli.jsonl")
         self.table = Table.open(self.path)
@@ -143,6 +154,7 @@ class CliTests(unittest.TestCase):
 
 class SqlCliTests(unittest.TestCase):
     def setUp(self):
+        forget_passphrase(self)
         self.tmpdir = tempfile.TemporaryDirectory(prefix="tinydb-test-")
         self.dir = os.path.join(self.tmpdir.name, "data")
         self.kv_path = os.path.join(self.tmpdir.name, "kv.jsonl")
@@ -214,6 +226,85 @@ class SqlCliTests(unittest.TestCase):
     def test_bad_sql_in_the_prompt_does_not_stop_it(self):
         output = self.piped("SELECT * FROM nope;\nset a 1\n")
         self.assertEqual(output, "Error: No table named nope\nOK\n")
+
+
+class ApiCommandTests(unittest.TestCase):
+    """python3 main.py serve and python3 main.py apikey ... (Phase 6)."""
+
+    def setUp(self):
+        forget_passphrase(self)
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="tinydb-test-")
+        self.dir = os.path.join(self.tmpdir.name, "data")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_apikey_create_and_list(self):
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main(["--dir", self.dir, "apikey", "create", "dashboard", "--role", "read"]), 0)
+            self.assertEqual(main(["--dir", self.dir, "apikey", "list"]), 0)
+        keys = KeyStore.in_folder(self.dir).keys()
+        self.assertEqual([(k.name, k.role) for k in keys], [("dashboard", "read")])
+        self.assertIn(keys[0].id, out.getvalue())
+
+    def test_apikey_revoke(self):
+        api_key, _ = KeyStore.in_folder(self.dir).create("dashboard", "read")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["--dir", self.dir, "apikey", "revoke", api_key.id]), 0)
+        self.assertEqual(len(KeyStore.in_folder(self.dir)), 0)
+
+    def test_serve_passes_the_folder_and_options_to_the_server(self):
+        with mock.patch("tinydb.server.main", return_value=0) as server_main:
+            self.assertEqual(main(["--dir", self.dir, "serve", "--port", "9000"]), 0)
+        server_main.assert_called_once_with(["--dir", self.dir, "--port", "9000"])
+
+    def test_keys_is_still_the_key_value_command(self):
+        db_path = os.path.join(self.tmpdir.name, "kv.jsonl")
+        with redirect_stdout(io.StringIO()) as out:
+            main(["--db", db_path, "set", "a", "1"])
+            main(["--db", db_path, "keys"])
+        self.assertEqual(out.getvalue(), "OK\na\n")
+
+
+class PassphraseTests(unittest.TestCase):
+    PASSPHRASE = "correct horse battery staple"
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="tinydb-test-")
+        self.dir = os.path.join(self.tmpdir.name, "data")
+        Database(self.dir, passphrase=self.PASSPHRASE, iterations=1000).run(
+            "CREATE TABLE t (id INT PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'Ada')")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_environment_variable_comes_first(self):
+        asked = []
+        found = passphrase_for(self.dir, {PASSPHRASE_VARIABLE: "from env"}, ask=asked.append)
+        self.assertEqual((found, asked), ("from env", []))
+
+    def test_asks_when_encrypted_and_not_set(self):
+        self.assertEqual(passphrase_for(self.dir, {}, ask=lambda prompt: "typed"), "typed")
+
+    def test_never_asks_for_a_plain_folder(self):
+        plain = os.path.join(self.tmpdir.name, "plain")
+        self.assertIsNone(passphrase_for(plain, {}, ask=lambda prompt: self.fail("asked")))
+
+    def test_empty_variable_means_none(self):
+        self.assertIsNone(passphrase_for(os.path.join(self.tmpdir.name, "plain"), {PASSPHRASE_VARIABLE: ""}))
+
+    def test_sql_on_an_encrypted_folder(self):
+        with mock.patch.dict(os.environ, {PASSPHRASE_VARIABLE: self.PASSPHRASE}):
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(main(["--dir", self.dir, "SELECT name FROM t;"]), 0)
+        self.assertIn("Ada", out.getvalue())
+
+    def test_wrong_passphrase_prints_an_error(self):
+        with mock.patch.dict(os.environ, {PASSPHRASE_VARIABLE: "not the right passphrase"}):
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(main(["--dir", self.dir, "SELECT name FROM t;"]), 2)
+        self.assertIn("Wrong passphrase", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

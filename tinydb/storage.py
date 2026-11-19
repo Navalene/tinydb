@@ -12,6 +12,11 @@ Every change is one line at the end of the file, for example:
 
 A line only counts once it ends with a newline, so a line torn by a crash
 halfway through a write is ignored and trimmed off.
+
+Phase 6 adds encryption at rest. Give Storage a Cipher and every line is
+encrypted before it's written and decrypted as it's read, so the file holds
+lines like AWm3k...Qs== instead of JSON. Nothing else changes: a line that
+won't decrypt is handled exactly like a line that isn't valid JSON.
 """
 
 import json
@@ -26,9 +31,26 @@ class CorruptLogError(ValueError):
 class Storage:
     """Reads and writes one append-only log file."""
 
-    def __init__(self, path):
+    def __init__(self, path, cipher=None):
         self.path = path
         self.entry_count = 0
+        self.cipher = cipher  # a tinydb.crypto.Cipher, or None to write plain JSON
+        # Each line is sealed with its file's name, so a line copied into another file won't decrypt.
+        self._associated = os.path.basename(path).encode("utf-8")
+
+    def encode(self, entry):
+        """Turn an entry into one line of text, without the newline. Encrypted if there's a cipher."""
+        text = json.dumps(entry, ensure_ascii=False)
+        if self.cipher is None:
+            return text
+        return self.cipher.encrypt_text(text, self._associated)
+
+    def decode(self, line):
+        """Turn one line (bytes) back into an entry. Raises ValueError if it can't."""
+        text = line.decode("utf-8")
+        if self.cipher is not None:
+            text = self.cipher.decrypt_text(text.strip(), self._associated)  # DecryptionError is a ValueError
+        return json.loads(text)
 
     def replay(self, apply):
         """Call apply(entry) on every complete entry in the log, oldest first.
@@ -52,7 +74,7 @@ class Storage:
                 valid_bytes += len(line) + 1
                 continue
             try:
-                apply(json.loads(line.decode("utf-8")))
+                apply(self.decode(line))
             except (ValueError, KeyError, TypeError) as e:
                 if number == len(complete):
                     break
@@ -72,7 +94,7 @@ class Storage:
 
     def append(self, entry):
         """Write one entry as a new line at the end of the log and force it to disk."""
-        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        line = self.encode(entry) + "\n"
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(line)
             f.flush()
@@ -87,7 +109,7 @@ class Storage:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 for entry in entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    f.write(self.encode(entry) + "\n")
                     count += 1
                 f.flush()
                 os.fsync(f.fileno())

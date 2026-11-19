@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Document** | HTTP API specification |
-| **Version** | 0.5 (Phase 5). The server is built in Phase 6. |
-| **Date** | 2026-11-18 |
+| **Version** | 0.6 (Phase 6). Designed in Phase 5, built in Phase 6 (`tinydb/server.py`). |
+| **Date** | 2026-11-19 |
 | **Related** | [requirements.md](requirements.md) (FR-24 to FR-28), [architecture.md](architecture.md), [openapi.yaml](openapi.yaml) |
 
 ## 1. Overview
@@ -20,6 +20,16 @@ The API sends tinydb's mini-SQL over HTTP and returns JSON. The HTTP method tell
 
 **Base URL:** `http://127.0.0.1:8000`. The server only listens on this computer unless it's started with another host.
 
+**Starting it:**
+
+```bash
+python3 main.py apikey create dashboard --role read      # prints a key once
+python3 main.py apikey create intake-app --role write
+python3 main.py serve                                    # or: python3 main.py --dir demo_data serve --port 9000
+```
+
+The examples below use `$READ_KEY` and `$WRITE_KEY` for those two keys.
+
 ### Why QUERY
 
 `QUERY` is a standard HTTP method, defined in [RFC 10008](https://www.rfc-editor.org/rfc/rfc10008) (June 2026). Like `GET`, it is **safe** (it never changes data) and **idempotent** (sending it twice gives the same effect as once), so clients may retry it and caches may store it. Unlike `GET`, it carries the query in the **request body**, so a long `SELECT` doesn't have to fit in a URL, isn't written to access logs as part of one, and needs no URL encoding.
@@ -32,13 +42,15 @@ Because QUERY must be safe, the server **parses the whole body first** and refus
 |---|---|---|
 | `Content-Type` | Yes, for `QUERY` and `POST` | `application/sql` (`charset=utf-8` may be added) |
 | `Content-Length` | Yes, for `QUERY` and `POST` | Size of the body in bytes. At most **1,048,576** (1 MB). |
-| `Authorization` | Yes, from Phase 6, except `GET /health` and `OPTIONS` | `Bearer <api key>` |
+| `Authorization` | Yes, except for `GET /health` and `OPTIONS` | `Bearer <api key>`. A `read` key works on `/query`. A `write` key works on both paths. |
 
-The body is UTF-8 SQL text: one statement, or several separated by `;`. Text values use single quotes (`'O''Brien'` for a quote inside text), and `--` starts a comment, the same as in the shell.
+Send exactly one `Content-Length` and no `Transfer-Encoding`. The body must arrive in full: if the connection ends early, nothing runs.
+
+The body is UTF-8 SQL text: one statement, or several (at most **100**) separated by `;`. Text values use single quotes (`'O''Brien'` for a quote inside text), and `--` starts a comment, the same as in the shell.
 
 ## 3. Responses
 
-Every response body is JSON with `Content-Type: application/json; charset=utf-8`, except `204` responses, which have no body. Every response also has `Cache-Control: no-store`, because the data can change with the next write.
+Every response body is JSON with `Content-Type: application/json; charset=utf-8`, except `204` responses, which have no body. Every JSON response also has `Cache-Control: no-store` (the data can change with the next write), `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` (a browser must never run or frame it). The `Server` header names tinydb's version but not Python's.
 
 ### 3.1 Success
 
@@ -98,15 +110,18 @@ Every response body is JSON with `Content-Type: application/json; charset=utf-8`
 | `400` | `DatabaseError` | The statement can't run, like `No table named nope` or a duplicate primary key |
 | `400` | `WrongMethod` | A write was sent with `QUERY`, or a read with `POST`. The message says which method to use. |
 | `400` | `EmptyRequest` | The body holds no statement |
-| `400` | `BadRequest` | The body isn't valid UTF-8 |
-| `401` | `Unauthorized` | Missing or wrong API key (Phase 6). Sent with `WWW-Authenticate: Bearer`. |
+| `400` | `BadRequest` | The body isn't valid UTF-8, ended before `Content-Length` bytes, has over 100 statements, or the length headers are ambiguous (two `Content-Length`s, or one with `Transfer-Encoding`) |
+| `401` | `Unauthorized` | Missing, wrong or revoked API key. Sent with `WWW-Authenticate: Bearer realm="tinydb"` (plus `error="invalid_token"` when a key was sent). |
+| `403` | `Forbidden` | A `read` key was used with `POST /execute` |
 | `404` | `NotFound` | No such path |
 | `405` | `MethodNotAllowed` | The path doesn't take this method, like `GET /query`. Sent with an `Allow` header. |
+| `408` | `Timeout` | The body didn't arrive within 10 seconds |
 | `411` | `LengthRequired` | No `Content-Length` header |
 | `413` | `TooLarge` | Body over 1 MB |
 | `415` | `UnsupportedMediaType` | `Content-Type` isn't `application/sql`. Sent with `Accept-Query` (on `/query`). |
 | `500` | `InternalError` | A bug in tinydb. The message is generic, so no internal details leak out. |
 | `501` | (no JSON) | A method tinydb doesn't know at all, like `PUT`. `http.server` sends this itself. |
+| `503` | `Busy` | 32 connections are already open. Sent with `Retry-After: 1`. |
 
 ## 4. Endpoints
 
@@ -116,6 +131,7 @@ Runs one or more read statements: `SELECT`, `SHOW TABLES`, `DESCRIBE`.
 
 ```bash
 curl -X QUERY http://127.0.0.1:8000/query \
+  -H "Authorization: Bearer $READ_KEY" \
   -H "Content-Type: application/sql" \
   --data-binary "SELECT client_id, reason, deadline FROM enrollment_periods
                  WHERE period = 'SEP' AND deadline >= '2026-11-18' AND deadline <= '2026-12-31'
@@ -128,6 +144,7 @@ Two reads in one request:
 
 ```bash
 curl -X QUERY http://127.0.0.1:8000/query \
+  -H "Authorization: Bearer $READ_KEY" \
   -H "Content-Type: application/sql" \
   --data-binary "SHOW TABLES; SELECT name, plan_code FROM clients WHERE id = 2;"
 ```
@@ -147,6 +164,7 @@ A write sent with QUERY is refused, and nothing in the body runs:
 
 ```bash
 curl -X QUERY http://127.0.0.1:8000/query \
+  -H "Authorization: Bearer $READ_KEY" \
   -H "Content-Type: application/sql" \
   --data-binary "SELECT * FROM clients; DELETE FROM clients;"
 ```
@@ -165,6 +183,7 @@ Runs one or more write statements: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`,
 
 ```bash
 curl -X POST http://127.0.0.1:8000/execute \
+  -H "Authorization: Bearer $WRITE_KEY" \
   -H "Content-Type: application/sql" \
   --data-binary "INSERT INTO clients (id, name, birth_date, zip) VALUES
                  (6, 'Fay Nguyen', '1958-03-01', '33101'),
@@ -189,6 +208,12 @@ curl -X POST http://127.0.0.1:8000/execute \
 ```
 
 A read sent with POST is refused before anything runs, with `WrongMethod` and the message `SELECT only reads, so send it with QUERY /query. Nothing was run.`
+
+A `read` key sent with POST gets `403`, and nothing runs:
+
+```json
+{"error": {"type": "Forbidden", "message": "Key 3f9a1c2e is read-only, so it can't use POST /execute."}}
+```
 
 ### 4.3 `OPTIONS /query` and `OPTIONS /execute`
 
@@ -222,14 +247,18 @@ curl http://127.0.0.1:8000/health
 
 ## 5. Security
 
-Phase 6 builds these. They're listed here so the API is designed for them from the start.
-
-- **API keys.** Every request except `GET /health` and `OPTIONS` needs `Authorization: Bearer <key>`. Keys are stored hashed, never in plain text.
-- **Injection-safe by design.** The body is parsed by the same lexer as the shell. Quoted text is always one value, so input can't change what a statement does.
-- **Limits.** Bodies over 1 MB are refused before they're read. Names may only use `a-z`, `0-9` and `_`.
-- **No leaks.** A `500` never includes a Python traceback.
-- **Local by default.** The server listens on `127.0.0.1`. Use HTTPS (through a proxy) before exposing it to a network, because API keys would otherwise travel in plain text.
+| Protection | How |
+|---|---|
+| **API keys** | `secrets.token_urlsafe(32)` keys starting with `tdb_`. Only a SHA-256 hash is stored, in `<dir>/_keys.json` (mode 0600). Checked with `hmac.compare_digest`, comparing every stored hash without stopping early. |
+| **Roles** | `read` keys: `QUERY /query` only. `write` keys: `/query` and `/execute`. The key is checked before the body is read. |
+| **Revoking** | `python3 main.py apikey revoke <id>`. The server rereads the keys file when it changes, so the key stops working right away. |
+| **Injection-safe parsing** | The body goes through the same lexer as the shell. Quoted text is always one value, so input can't change what a statement does. A write hidden after a read in a `QUERY` is refused before anything runs. |
+| **Whole bodies only** | A body shorter than `Content-Length` runs nothing, so a dropped connection can't cut a `WHERE` off a `DELETE`. |
+| **Limits** | 1 MB body, 100 statements, 10 seconds of silence, 32 connections, 64-character names, 30-character numbers, 64-bit INTs, finite FLOATs. |
+| **No leaks** | A `500` never includes a traceback. Errors never repeat the API key. Control characters in a path are escaped in the server log. |
+| **Encryption at rest** | Start the server with `TINYDB_PASSPHRASE` set (or type it at the prompt) and every log line in the folder is encrypted. See [architecture.md](architecture.md#8-server-and-security-design-phase-6). |
+| **Local by default** | The server listens on `127.0.0.1`. Put HTTPS (a proxy such as nginx) in front before exposing it to a network, because API keys would otherwise travel in plain text. |
 
 ## 6. Not included yet
 
-Joins, `OR` and `GROUP BY` (not in the SQL yet), paging large results, `ETag` caching, and `Content-Location` links that RFC 10008 allows a server to send so a client can re-run a query with `GET`.
+Joins, `OR` and `GROUP BY` (not in the SQL yet), parameterized queries (`?` placeholders, so apps never build SQL from strings), rate limiting failed keys, paging large results, `ETag` caching, and `Content-Location` links that RFC 10008 allows a server to send so a client can re-run a query with `GET`.

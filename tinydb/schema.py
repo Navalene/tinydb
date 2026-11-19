@@ -12,12 +12,15 @@ its value is unique in the table and becomes the row's record key.
 """
 
 import datetime
+import math
 from dataclasses import dataclass
 from typing import Tuple
 
 TYPES = ("INT", "FLOAT", "TEXT", "BOOL", "DATE")
 KEY_TYPES = ("INT", "TEXT", "DATE")  # types a primary key may have
 NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_"
+MAX_NAME = 64  # characters. Table names become file names, and file systems limit those.
+INT_MIN, INT_MAX = -(2 ** 63), 2 ** 63 - 1  # a 64-bit integer, the BIGINT range of most databases
 
 
 class SchemaError(ValueError):
@@ -31,6 +34,8 @@ def check_name(name, what="Name"):
     """
     if not isinstance(name, str) or name == "":
         raise SchemaError(f"{what} must be a non-empty string")
+    if len(name) > MAX_NAME:
+        raise SchemaError(f"{what} is {len(name)} characters long. The limit is {MAX_NAME}")
     if name[0].isdigit() or any(ch not in NAME_CHARS for ch in name):
         raise SchemaError(f"{what} {name!r} must use only a-z, 0-9 and _, and not start with a digit")
 
@@ -64,10 +69,15 @@ class Column:
             # bool is checked first because Python counts True as the int 1.
             if isinstance(value, bool) or not isinstance(value, int):
                 raise self._wrong_type(value)
+            if not INT_MIN <= value <= INT_MAX:
+                raise SchemaError(f"Column {self.name} is INT, so it must be between {INT_MIN} and {INT_MAX}")
             return value
         if self.type == "FLOAT":
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise self._wrong_type(value)
+            if not math.isfinite(value):
+                # 1e400 turns into inf, which JSON can't hold.
+                raise SchemaError(f"Column {self.name} is FLOAT, and {value!r} is too big to store")
             return float(value)
         if self.type == "BOOL":
             if not isinstance(value, bool):

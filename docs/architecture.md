@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | **Document** | Architecture and design |
-| **Version** | 0.5 (Phase 5) |
-| **Date** | 2026-11-18 |
+| **Version** | 0.6 (Phase 6) |
+| **Date** | 2026-11-19 |
 | **Related** | [requirements.md](requirements.md), [api-spec.md](api-spec.md) |
 
-This document explains **how** tinydb is built to meet its [requirements](requirements.md). The diagrams are written in Mermaid, which GitHub draws as pictures. Parts marked **planned** are designed here and built in Phase 6.
+This document explains **how** tinydb is built to meet its [requirements](requirements.md). The diagrams are written in Mermaid, which GitHub draws as pictures. Phase 5 designed the HTTP server and Phase 6 built it, along with API keys and encryption at rest.
 
 ## 1. Layers
 
@@ -16,7 +16,8 @@ tinydb is built in layers. Each layer only calls the one below it, and nothing b
 ```mermaid
 flowchart TD
     shell["Shell: cli.py<br/>python3 main.py"]
-    server["HTTP server: server.py<br/>planned, Phase 6"]
+    server["HTTP server: server.py<br/>routing, limits, JSON"]
+    auth["API keys: auth.py<br/>hashed, read or write role"]
     kvparser["QueryParser: query.py<br/>key-value commands"]
     lexer["Lexer: lexer.py<br/>text into tokens"]
     sqlparser["SqlParser: sql.py<br/>tokens into statements"]
@@ -26,10 +27,12 @@ flowchart TD
     indexes["HashIndex, BTreeIndex: index.py<br/>HashTable, BTree"]
     wal["WriteAheadLog: wal.py<br/>transactions, recovery"]
     storage["Storage: storage.py<br/>append, replay, rewrite"]
+    crypto["Cipher: crypto.py<br/>encrypts each line (optional)"]
     disk[("JSON-lines log files")]
 
     shell --> kvparser
     shell --> lexer
+    server --> auth
     server --> lexer
     lexer --> sqlparser
     sqlparser --> database
@@ -39,19 +42,18 @@ flowchart TD
     table --> indexes
     table --> wal
     wal --> storage
-    storage --> disk
-
-    classDef planned stroke-dasharray: 5 5
-    class server planned
+    storage --> crypto
+    crypto --> disk
 ```
 
 | Layer | Job | Knows nothing about |
 |---|---|---|
-| Interfaces (shell, server) | Read input, show output | How data is stored |
+| Interfaces (shell, server) | Read input, show output. The server also checks API keys and request limits. | How data is stored |
 | Parsers | Turn text into statement objects | Data, files |
 | Database | Check statements against schemas, pick a plan, run it, return a Result | Printing, HTTP |
 | Table and indexes | Hold records in memory, find them fast | SQL |
 | WriteAheadLog and Storage | Get changes safely onto disk, and back after a restart | What a record means |
+| Cipher | Encrypt and seal each log line when the folder has a passphrase | Anything above Storage |
 
 ## 2. Main classes
 
@@ -136,7 +138,7 @@ classDiagram
 - **Inheritance** (the hollow triangle): `HashIndex` and `BTreeIndex` share the `Index` base class. `WriteAheadLog` is a `Storage` that also understands transactions, so `Table` works with either one.
 - **Dependency injection:** a Table is given its Storage instead of building one inside itself. Tests pass in a temporary file, and Phase 4 passed in a WriteAheadLog without changing how Table uses it.
 
-## 3. Reading over HTTP (planned)
+## 3. Reading over HTTP
 
 A `SELECT` sent with the HTTP `QUERY` method. The server checks that every statement only reads **before** it runs any of them, because QUERY is a safe method ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008)).
 
@@ -148,8 +150,9 @@ sequenceDiagram
     participant D as Database
     participant T as Table
 
-    C->>H: QUERY /query, body: SELECT ... WHERE deadline >= '2026-11-18'
-    H->>H: check Content-Type and body size
+    C->>H: QUERY /query, Authorization: Bearer key, body: SELECT ... WHERE deadline >= '2026-11-18'
+    H->>H: check the API key (any role may read)
+    H->>H: check Content-Type and body size, read exactly Content-Length bytes
     H->>P: parse(body)
     P-->>H: [Select(...)]
     H->>H: every statement is a read? yes
@@ -163,7 +166,7 @@ sequenceDiagram
 
 If any statement in the body would change data, the server answers `400` and runs nothing. See [api-spec.md](api-spec.md) for every status code.
 
-## 4. Writing over HTTP (planned)
+## 4. Writing over HTTP
 
 An `INSERT` of several rows, sent with `POST`. The write-ahead log makes the whole statement one transaction.
 
@@ -176,7 +179,8 @@ sequenceDiagram
     participant T as Table
     participant W as WriteAheadLog
 
-    C->>H: POST /execute, body: INSERT INTO clients VALUES (...), (...)
+    C->>H: POST /execute, Authorization: Bearer key, body: INSERT INTO clients VALUES (...), (...)
+    H->>H: key is valid and has the write role? yes
     H->>H: parse, every statement is a write? yes
     H->>D: execute(Insert)
     D->>S: make_row(values) for each row
@@ -229,6 +233,8 @@ Replay rebuilds records **and** index contents. Only index definitions are logge
 tinydb.jsonl              key-value store used by the shell (--db)
 tinydb_data/              SQL database (--dir)
     _catalog.jsonl        which tables exist, and each one's schema
+    _keys.json            API keys: id, name, role and SHA-256 hash, never the key (mode 0600)
+    _crypto.json          only if encrypted: salt, PBKDF2 rounds, and a check value
     clients.jsonl         one log per table
     plans.jsonl
     enrollment_periods.jsonl
@@ -248,6 +254,8 @@ clients.jsonl
 
 A row is a Record. Its key is the primary key as text, and its value is a dict of its columns. NULL columns are left out.
 
+In an encrypted folder each of those lines is replaced by one base64 line: `version | nonce | ciphertext | tag`. The tag also covers the file's name, so a line can't be moved to another table's log.
+
 ## 7. Design decisions
 
 | Decision | Why | Trade-off |
@@ -260,10 +268,17 @@ A row is a Record. Its key is the primary key as text, and its value is a dict o
 | Database returns Result, never prints | The shell and the server format the same Result their own way | None |
 | QUERY for reads, POST for writes | The method tells clients and caches whether a request changes data. SQL fits in the body, not a URL. | Browsers can't send QUERY from forms yet, and some tools need `-X QUERY`. |
 | `http.server`, one lock around the Database | No framework, as the constraints require. One lock keeps two requests from changing a table at once. | One request uses the database at a time. That's fine for a small server. |
+| API keys stored as SHA-256 hashes, two roles | A copied keys file can't be used. Read keys only work with QUERY (least privilege). | Keys can't be shown again, only revoked and remade. |
+| Encryption from HMAC-SHA256 (CTR + encrypt-then-MAC) | The standard library has no AES, and the project allows no packages. | Unreviewed code. Production should use AES-GCM from a vetted library. |
+| Encryption in Storage only | One place to change. WAL, Table, indexes and SQL didn't change. | Line counts and sizes still show. File names stay readable. |
 
-## 8. Planned server design (Phase 6)
+## 8. Server and security design (Phase 6)
 
-- `server.py` adds a `do_QUERY`, `do_POST`, `do_OPTIONS` and `do_GET` method to a `BaseHTTPRequestHandler`. `http.server` calls `do_<METHOD>` for whatever method arrives, so QUERY needs no special setup.
+- `server.py` has `do_QUERY`, `do_POST`, `do_OPTIONS` and `do_GET` methods on a `BaseHTTPRequestHandler`. `http.server` calls `do_<METHOD>` for whatever method arrives, so QUERY needs no special setup. All four go to one router, and every refusal is raised as an `ApiError` that becomes a JSON error.
 - It runs on `ThreadingHTTPServer`, so a slow client doesn't block others while it sends its body. A single `threading.Lock` lets one request at a time use the Database.
-- It listens on `127.0.0.1:8000` by default and rejects bodies over 1 MB.
-- Phase 6 adds API keys, input checks and encryption at rest on top, without changing the layers below the server.
+- **Order of checks:** path, method, API key, role, headers, body. A stranger gets `401` before the server reads a byte of the body.
+- **Limits:** 1 MB bodies, 100 statements per request, 10 seconds of silence per connection, 32 connections at once (more get `503`), 64-character names, 30-character numbers, 64-bit INTs, finite FLOATs.
+- **The body must arrive whole.** If fewer than `Content-Length` bytes arrive, nothing runs, so a dropped connection can't turn `DELETE ... WHERE id = 5` into `DELETE FROM clients`.
+- **API keys** (`auth.py`) are 256-bit random tokens. Only their SHA-256 hashes are stored. They're checked with `hmac.compare_digest` without stopping early, and the keys file is reread when it changes, so a revoked key stops working right away.
+- **Encryption at rest** (`crypto.py`): PBKDF2 (600,000 rounds) turns the passphrase into an encryption key and a MAC key. Each line is XORed with an HMAC-SHA256 keystream and sealed with an HMAC tag. `Database` checks the passphrase against `_crypto.json` before any log is replayed, so recovery can never mistake a wrong passphrase for a torn write.
+- **Known limits:** someone who can write the files can still drop the newest line (it looks torn), roll the folder back, or reorder lines within a file. Fixing that needs chained tags and a counter kept somewhere else.

@@ -10,13 +10,19 @@ then execute() runs that Query against a Table.
 Phase 4 adds SQL. A line that starts with a SQL word (SELECT, INSERT, ...) or
 ends with ";" is SQL, and runs against the Database in the --dir folder. In the
 interactive prompt a SQL statement can span several lines and ends at ";".
+
+Phase 6 adds the HTTP API and its keys:
+    python3 main.py serve [--port 8000] [--host 127.0.0.1]
+    python3 main.py apikey create NAME --role read|write
+An encrypted --dir folder is opened with TINYDB_PASSPHRASE, or a hidden prompt.
 """
 
 import argparse
 import json
 import sys
 
-from tinydb.database import Database
+from tinydb import auth, server
+from tinydb.database import Database, passphrase_for
 from tinydb.query import QueryError, QueryParser
 from tinydb.storage import CorruptLogError
 from tinydb.table import Table
@@ -48,6 +54,13 @@ SQL (end each statement with ;):
   CREATE INDEX ON clients (age);            -- btree; add USING HASH for a hash index
   SHOW TABLES;  DESCRIBE clients;  DROP TABLE clients;
   Types: INT, FLOAT, TEXT, BOOL, DATE ('YYYY-MM-DD')
+
+HTTP API (Phase 6):
+  serve [--port 8000] [--host 127.0.0.1]     run the API on the --dir folder
+  apikey create NAME [--role read|write]     make an API key (shown once)
+  apikey list                                list keys (ids, roles, names)
+  apikey revoke ID                           delete a key so it stops working
+  Encrypt a new --dir folder: export TINYDB_PASSPHRASE='a long passphrase' first
 
   help                show this message
   exit                quit the interactive prompt"""
@@ -280,7 +293,7 @@ def repl(table, directory):
 def open_database(directory):
     """Open the SQL Database, or print why it can't be opened and return None."""
     try:
-        return Database(directory)
+        return Database(directory, passphrase=passphrase_for(directory))
     except (CorruptLogError, ValueError, KeyError, TypeError) as e:
         print(f"Error: can't open the database in {directory!r}: {e}", file=sys.stderr)
         return None
@@ -297,6 +310,13 @@ def main(argv=None):
     arg_parser.add_argument("--dir", default="tinydb_data", help="folder for SQL tables (default: tinydb_data)")
     arg_parser.add_argument("command", nargs=argparse.REMAINDER, help="command or SQL to run; omit to open the interactive prompt")
     options = arg_parser.parse_args(argv)
+
+    # The HTTP API commands hand the rest of the words to their own modules.
+    first = options.command[0] if options.command else ""
+    if first == "serve":
+        return server.main(["--dir", options.dir] + options.command[1:])
+    if first == "apikey":
+        return auth.main(["--dir", options.dir] + options.command[1:])
 
     text = " ".join(options.command)
     if is_sql(text):
