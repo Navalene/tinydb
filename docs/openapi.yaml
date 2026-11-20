@@ -1,14 +1,17 @@
 # tinydb HTTP API, as an OpenAPI 3.2 description.
-# The human-readable version is api-spec.md. Built in Phase 6 (tinydb/server.py).
+# The human-readable version is api-spec.md. Built in Phase 6 (tinydb/server.py),
+# parameterized queries (application/json bodies) added in Phase 7.
 openapi: 3.2.0
 info:
   title: tinydb HTTP API
-  version: 0.6.0
+  version: 1.0.0
   description: >
     Mini-SQL over HTTP. Reads use the QUERY method (RFC 10008) on /query.
     Writes use POST on /execute. The method tells you whether a request
     can change data. Every request except GET /health and OPTIONS needs an
     API key: a read key may use /query, a write key may use both paths.
+    Send plain SQL as application/sql, or SQL with ? placeholders and their
+    values as application/json.
 servers:
   - url: http://127.0.0.1:8000
     description: Local server (listens on this computer only)
@@ -147,7 +150,7 @@ paths:
                     const: ok
                   version:
                     type: string
-                    example: 0.6.0
+                    example: 1.0.0
 
 components:
   securitySchemes:
@@ -164,7 +167,7 @@ components:
       description: Body formats this resource accepts with QUERY (RFC 10008)
       schema:
         type: string
-        example: application/sql
+        example: application/sql, application/json
 
   requestBodies:
     Sql:
@@ -172,6 +175,8 @@ components:
       description: >
         One to 100 SQL statements separated by semicolons, at most 1 MB, sent
         with exactly one Content-Length. A body that arrives short runs nothing.
+        As application/json, the SQL may use ? placeholders, filled in order
+        from params. The values never become part of the SQL text.
       content:
         application/sql:
           schema:
@@ -181,8 +186,28 @@ components:
             SELECT client_id, reason, deadline FROM enrollment_periods
             WHERE period = 'SEP' AND deadline >= '2026-11-18'
             ORDER BY deadline;
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ParameterizedSql"
+          example:
+            sql: SELECT client_id, reason, deadline FROM enrollment_periods WHERE period = ? AND deadline >= ? ORDER BY deadline
+            params: [SEP, "2026-11-18"]
 
   schemas:
+    ParameterizedSql:
+      type: object
+      required: [sql]
+      additionalProperties: false
+      properties:
+        sql:
+          type: string
+          description: SQL text with a ? wherever a value goes (WHERE, VALUES, SET)
+        params:
+          type: array
+          description: One value per ?, in order, across every statement. Numbers have at most 30 digits.
+          default: []
+          items:
+            $ref: "#/components/schemas/Value"
     Value:
       description: "A cell: INT or FLOAT is a number, TEXT and DATE (YYYY-MM-DD) are strings, BOOL is a boolean, NULL is null."
       type: [string, number, boolean, "null"]

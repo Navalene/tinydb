@@ -93,7 +93,7 @@ class QueryTests(ServerTestCase):
         _, response, _ = self.query("SHOW TABLES")
         self.assertEqual(response.getheader("Content-Type"), "application/json; charset=utf-8")
         self.assertEqual(response.getheader("Cache-Control"), "no-store")
-        self.assertEqual(response.getheader("Accept-Query"), "application/sql")
+        self.assertEqual(response.getheader("Accept-Query"), "application/sql, application/json")
 
     def test_several_reads(self):
         _, _, body = self.query("SHOW TABLES; DESCRIBE clients;")
@@ -188,9 +188,9 @@ class RequestCheckTests(ServerTestCase):
         self.assertEqual(status, 200)
 
     def test_wrong_content_type(self):
-        reply = self.request("QUERY", "/query", "SHOW TABLES", {"Content-Type": "application/json"})
+        reply = self.request("QUERY", "/query", "SHOW TABLES", {"Content-Type": "text/plain"})
         self.assertError(reply, 415, "UnsupportedMediaType")
-        self.assertEqual(reply[1].getheader("Accept-Query"), "application/sql")
+        self.assertEqual(reply[1].getheader("Accept-Query"), "application/sql, application/json")
 
     def test_missing_content_type(self):
         self.assertError(self.request("POST", "/execute", "DROP TABLE clients"), 415, "UnsupportedMediaType")
@@ -236,7 +236,7 @@ class OptionsAndHealthTests(ServerTestCase):
         self.assertEqual(status, 204)
         self.assertIsNone(body)
         self.assertEqual(response.getheader("Allow"), "QUERY, OPTIONS")
-        self.assertEqual(response.getheader("Accept-Query"), "application/sql")
+        self.assertEqual(response.getheader("Accept-Query"), "application/sql, application/json")
 
     def test_options_execute(self):
         status, response, _ = self.request("OPTIONS", "/execute")

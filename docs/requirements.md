@@ -3,15 +3,15 @@
 | | |
 |---|---|
 | **Document** | Software requirements specification |
-| **Version** | 0.6 (Phase 6) |
-| **Date** | 2026-11-19 |
-| **Status** | Phases 1 to 6 built and tested (458 tests), including the HTTP API, API keys and encryption at rest. |
+| **Version** | 1.0 (Phase 7) |
+| **Date** | 2026-11-20 |
+| **Status** | All 7 phases built and tested (540 tests): the engine, the HTTP API with API keys and encryption at rest, parameterized queries, benchmarks and a demo. |
 
 ## 1. Purpose and scope
 
 tinydb is a small database engine written from scratch in pure Python. It stores data in an append-only log, rebuilds its state from that log on startup, indexes data with a hand-built hash table and B-tree, and runs a mini-SQL language with typed tables and atomic writes.
 
-This document says **what** tinydb must do and **how well**, so every feature can be checked against a test. It covers the engine (Phases 1 to 4) and the HTTP API and its security (Phase 6). [architecture.md](architecture.md) explains how it is built, and [api-spec.md](api-spec.md) defines the HTTP API.
+This document says **what** tinydb must do and **how well**, so every feature can be checked against a test. It covers the engine (Phases 1 to 4), the HTTP API and its security (Phase 6), and parameterized queries, benchmarks and the demo (Phase 7). [architecture.md](architecture.md) explains how it is built, and [api-spec.md](api-spec.md) defines the HTTP API.
 
 ## 2. Users
 
@@ -39,6 +39,10 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 **UC-7 Change data over HTTP.** An application with a read-write API key sends `INSERT`, `UPDATE` or `DELETE` SQL with `POST` and gets back a message such as `Inserted 3 rows`.
 
 **UC-8 Keep client data private on disk.** The agent's laptop is lost. The database folder was opened with a passphrase, so the files hold no readable names, birth dates or Medicaid status, and they can't be opened without the passphrase.
+
+**UC-9 Search by what a user typed.** An application lets the agent search clients by name. It sends `SELECT ... WHERE name = ?` with the typed name as a separate value. A name like `O'Brien` works without escaping, and input like `x'; DROP TABLE clients; --` finds nobody and changes nothing.
+
+**UC-10 Show and measure the project.** A reviewer runs `python3 -m tinydb.demo` and watches the API answer real requests, then runs `python3 -m tinydb.bench` and gets a table of timings for their own machine.
 
 ## 4. Functional requirements
 
@@ -120,21 +124,39 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 | FR-35 | Must refuse a wrong or missing passphrase before reading any log, and change no file. | 6 | `test_encryption.py` |
 | FR-36 | Must read the passphrase from `TINYDB_PASSPHRASE` or a hidden prompt, never from a command-line argument. | 6 | `test_cli.py` |
 
+### 4.9 Parameterized queries
+
+| ID | Requirement | Phase | Checked by |
+|---|---|---|---|
+| FR-37 | Must accept a `?` placeholder anywhere a value can go (`WHERE`, `VALUES`, `SET`), filled in order from values passed separately, which never pass through the lexer. | 7 | `test_params.py` |
+| FR-38 | Must refuse, before running anything, too few or too many values, values that aren't a list, and values that aren't a string, number, boolean or null. | 7 | `test_params.py` |
+| FR-39 | Must accept SQL with values as an `application/json` body (`sql`, `params`) on both API paths, and refuse unknown fields, numbers over 30 digits, `NaN` and `Infinity`. | 7 | `test_params.py` |
+
+### 4.10 Performance and showcase
+
+| ID | Requirement | Phase | Checked by |
+|---|---|---|---|
+| FR-40 | Must give a B-tree both ends of a range on its column (`deadline >= X AND deadline <= Y`), so it reads only the rows in the range. | 7 | `test_planner.py` |
+| FR-41 | Must generate the same made-up Medicare data of any size from a seed. | 7 | `test_sample.py` |
+| FR-42 | Must benchmark inserts, lookups, ranges, startup, compaction, HTTP and encryption, and print the results as a Markdown table. | 7 | `test_bench.py` |
+| FR-43 | Must include a guided demo that runs the real server and checks every answer it shows. | 7 | `test_demo.py` |
+
 ## 5. Non-functional requirements
 
 | ID | Quality | Requirement |
 |---|---|---|
 | NFR-1 | Durability | A write is reported as done only after it has been `fsync`ed to disk. |
 | NFR-2 | Reliability | A crash at any point never leaves a half-applied statement after restart. |
-| NFR-3 | Performance | A primary-key lookup is O(1). An indexed `=` or range is O(log n + k). Phase 7 measures real numbers. |
+| NFR-3 | Performance | A primary-key lookup is O(1). An indexed `=` or range is O(log n + k), where k is the rows returned. Measured numbers are in [benchmarks.md](benchmarks.md). |
 | NFR-4 | Portability | Runs on Python 3.8 or newer on macOS and Linux, with only the standard library. |
 | NFR-5 | Security | Table and column names may only use `a-z`, `0-9` and `_`, so a name can't become a path outside the data folder. |
-| NFR-6 | Security | Quoted text is always data and never SQL, so input can't change what a statement does (no SQL injection). |
+| NFR-6 | Security | Quoted text is always data and never SQL, and `?` values never pass through the lexer at all, so input can't change what a statement does (no SQL injection). |
 | NFR-7 | Security | The server listens on `127.0.0.1` by default, never sends a traceback or its Python version, and sends `nosniff` and `Content-Security-Policy` headers. |
 | NFR-8 | Maintainability | One module per job, one test file per module, and 0 problems in VS Code (Pylance). |
 | NFR-9 | Testability | The engine never prints. It returns Result objects, so it can be tested without capturing output. |
 | NFR-10 | Usability | Every error says what went wrong in plain words, such as `Column age is INT, so it can't hold 'old'`. |
 | NFR-11 | Security | Secrets are compared in constant time (`hmac.compare_digest`), and random values come from `secrets`, never `random`. |
+| NFR-12 | Performance | Requests on a kept-alive HTTP connection are never held back by Nagle's algorithm (the server sets `TCP_NODELAY`). Checked by `KeepAliveTest` in `test_bench.py`. |
 
 ## 6. Constraints
 
@@ -145,7 +167,7 @@ This document says **what** tinydb must do and **how well**, so every feature ca
 
 ## 7. Out of scope
 
-Joins, `OR`, `GROUP BY` and aggregate functions, parameterized queries (`?` placeholders), transactions that span several statements, replication, HTTPS in the server itself (use a proxy), and user accounts beyond API keys. These are good next steps, but tinydb doesn't need them to meet its goals.
+Joins, `OR`, `GROUP BY` and aggregate functions, transactions that span several statements, replication, HTTPS in the server itself (use a proxy), and user accounts beyond API keys. These are good next steps, but tinydb doesn't need them to meet its goals.
 
 ## 8. Glossary
 
@@ -162,3 +184,6 @@ Joins, `OR`, `GROUP BY` and aggregate functions, parameterized queries (`?` plac
 | API key | A long random secret that a program sends with each request to prove it's allowed in. |
 | Encryption at rest | Data is encrypted in the files on disk, so a copy of the files can't be read without the key. |
 | SEP | Special Enrollment Period: a Medicare window, with a deadline, for changing plans after a life event. |
+| Parameterized query | SQL with a `?` where each value goes, and the values sent separately, so they can never become SQL. |
+| Benchmark | A repeatable measurement of how long something takes, reported as the median of several runs. |
+| Nagle's algorithm | A TCP feature that holds back small writes until earlier ones are acknowledged. Turned off with `TCP_NODELAY`. |

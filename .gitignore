@@ -8,3 +8,6 @@ tinydb_data/
 demo_data/
 secure_data/
 secure_demo/
+sample_data/
+bench-*.txt
+demo-output.txt

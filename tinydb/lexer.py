@@ -11,6 +11,9 @@ The lexer only cares what kind of word each piece is. Whether the words make
 a valid statement is the parser's job. Text in 'single quotes' always becomes
 one STRING token, so a value can never turn into SQL code. That is the root
 of injection-safe parsing.
+
+Phase 7 adds the ? placeholder, a SYMBOL token that stands for a value sent
+separately from the SQL text. See sql.py.
 """
 
 import string
@@ -31,7 +34,7 @@ KEYWORDS = {
     "VALUES", "WHERE",
 }
 MAX_NUMBER_LENGTH = 30  # digits; far more than any real value, and stops numbers too big to handle
-SYMBOLS = ("<=", ">=", "!=", "<>", "(", ")", ",", ";", "*", "=", "<", ">")  # two-character ones first
+SYMBOLS = ("<=", ">=", "!=", "<>", "(", ")", ",", ";", "*", "=", "<", ">", "?")  # two-character ones first
 WORD_START = string.ascii_letters + "_"
 WORD_CHARS = WORD_START + string.digits
 

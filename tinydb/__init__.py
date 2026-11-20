@@ -1,7 +1,7 @@
 """tinydb: a tiny database engine written from scratch in pure Python."""
 
 # First, before the imports below: server.py reads tinydb.__version__ while it's being imported.
-__version__ = "0.6.0"
+__version__ = "1.0.0"
 
 from tinydb.algorithms import binary_search, merge_sort
 from tinydb.auth import ApiKey, KeyStore

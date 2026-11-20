@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | **Document** | Architecture and design |
-| **Version** | 0.6 (Phase 6) |
-| **Date** | 2026-11-19 |
-| **Related** | [requirements.md](requirements.md), [api-spec.md](api-spec.md) |
+| **Version** | 1.0 (Phase 7) |
+| **Date** | 2026-11-20 |
+| **Related** | [requirements.md](requirements.md), [api-spec.md](api-spec.md), [benchmarks.md](benchmarks.md), [design.md](design.md) |
 
-This document explains **how** tinydb is built to meet its [requirements](requirements.md). The diagrams are written in Mermaid, which GitHub draws as pictures. Phase 5 designed the HTTP server and Phase 6 built it, along with API keys and encryption at rest.
+This document explains **how** tinydb is built to meet its [requirements](requirements.md). The diagrams are written in Mermaid, which GitHub draws as pictures. Phase 5 designed the HTTP server and Phase 6 built it, along with API keys and encryption at rest. Phase 7 added parameterized queries, benchmarks and a demo, and fixed the two performance bugs the benchmarks found.
 
 ## 1. Layers
 
@@ -15,6 +15,7 @@ tinydb is built in layers. Each layer only calls the one below it, and nothing b
 
 ```mermaid
 flowchart TD
+    tools["Benchmarks and demo: bench.py, demo.py<br/>data from sample.py"]
     shell["Shell: cli.py<br/>python3 main.py"]
     server["HTTP server: server.py<br/>routing, limits, JSON"]
     auth["API keys: auth.py<br/>hashed, read or write role"]
@@ -30,6 +31,8 @@ flowchart TD
     crypto["Cipher: crypto.py<br/>encrypts each line (optional)"]
     disk[("JSON-lines log files")]
 
+    tools --> server
+    tools --> database
     shell --> kvparser
     shell --> lexer
     server --> auth
@@ -48,6 +51,7 @@ flowchart TD
 
 | Layer | Job | Knows nothing about |
 |---|---|---|
+| Tools (benchmarks, demo) | Build sample data, then measure or demonstrate the layers below through their normal entry points | Anything inside those layers |
 | Interfaces (shell, server) | Read input, show output. The server also checks API keys and request limits. | How data is stored |
 | Parsers | Turn text into statement objects | Data, files |
 | Database | Check statements against schemas, pick a plan, run it, return a Result | Printing, HTTP |
@@ -61,7 +65,7 @@ flowchart TD
 classDiagram
     class Database {
         +directory
-        +run(sql) list~Result~
+        +run(sql, params) list~Result~
         +execute(statement) Result
         +create_table(name, schema)
         +drop_table(name)
@@ -140,7 +144,7 @@ classDiagram
 
 ## 3. Reading over HTTP
 
-A `SELECT` sent with the HTTP `QUERY` method. The server checks that every statement only reads **before** it runs any of them, because QUERY is a safe method ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008)).
+A `SELECT` sent with the HTTP `QUERY` method, as JSON with `?` placeholders. The server checks that every statement only reads **before** it runs any of them, because QUERY is a safe method ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008)). A plain `application/sql` body takes the same path with no values.
 
 ```mermaid
 sequenceDiagram
@@ -150,14 +154,15 @@ sequenceDiagram
     participant D as Database
     participant T as Table
 
-    C->>H: QUERY /query, Authorization: Bearer key, body: SELECT ... WHERE deadline >= '2026-11-18'
+    C->>H: QUERY /query, Authorization: Bearer key, body: {"sql": "SELECT ... WHERE deadline >= ? AND deadline <= ?", "params": [...]}
     H->>H: check the API key (any role may read)
     H->>H: check Content-Type and body size, read exactly Content-Length bytes
-    H->>P: parse(body)
-    P-->>H: [Select(...)]
+    H->>H: split the JSON into sql and params
+    H->>P: parse(sql, params)
+    P-->>H: [Select(...)] with each ? already filled by its value
     H->>H: every statement is a read? yes
     H->>D: execute(Select)
-    D->>T: find_range("deadline", low, None)
+    D->>T: find_range("deadline", low, high)
     T-->>D: matching records, plan "btree index on deadline"
     D->>D: recheck every condition, merge sort, LIMIT
     D-->>H: Result(columns, rows, plan)
@@ -271,6 +276,11 @@ In an encrypted folder each of those lines is replaced by one base64 line: `vers
 | API keys stored as SHA-256 hashes, two roles | A copied keys file can't be used. Read keys only work with QUERY (least privilege). | Keys can't be shown again, only revoked and remade. |
 | Encryption from HMAC-SHA256 (CTR + encrypt-then-MAC) | The standard library has no AES, and the project allows no packages. | Unreviewed code. Production should use AES-GCM from a vetted library. |
 | Encryption in Storage only | One place to change. WAL, Table, indexes and SQL didn't change. | Line counts and sizes still show. File names stay readable. |
+| `?` values filled in by the parser | A value goes straight into the parsed statement and never through the lexer, so it can't become SQL. The rest of the engine didn't change. | Placeholders only stand for values, not table or column names (the same rule as every real database). |
+| JSON body for parameterized queries | Values keep their types (number, string, `true`, `null`) with no new encoding to invent. | Two body formats to accept and test. |
+| Planner gives a B-tree both ends of a range | Found by the benchmark: with one end, a one-week range read most of the table. | None. The final check on every row still guarantees the right answer. |
+| `TCP_NODELAY` on server sockets | Found by the benchmark: Nagle's algorithm plus delayed ACK added about 40 ms to every kept-alive request. | Slightly more small packets on the network. |
+| Seeded sample data and a fixed demo date | Benchmarks and the demo give the same data and answers on every run and every machine. | The demo's "today" is a fixed date, said out loud. |
 
 ## 8. Server and security design (Phase 6)
 
@@ -282,3 +292,10 @@ In an encrypted folder each of those lines is replaced by one base64 line: `vers
 - **API keys** (`auth.py`) are 256-bit random tokens. Only their SHA-256 hashes are stored. They're checked with `hmac.compare_digest` without stopping early, and the keys file is reread when it changes, so a revoked key stops working right away.
 - **Encryption at rest** (`crypto.py`): PBKDF2 (600,000 rounds) turns the passphrase into an encryption key and a MAC key. Each line is XORed with an HMAC-SHA256 keystream and sealed with an HMAC tag. `Database` checks the passphrase against `_crypto.json` before any log is replayed, so recovery can never mistake a wrong passphrase for a torn write.
 - **Known limits:** someone who can write the files can still drop the newest line (it looks torn), roll the folder back, or reorder lines within a file. Fixing that needs chained tags and a counter kept somewhere else.
+
+## 9. Measuring and showing (Phase 7)
+
+- **`sample.py`** generates made-up plans, clients and enrollment periods from a seed, with its own `random.Random`, so the same seed always gives the same rows. It loads 500 rows per `INSERT`, one transaction and one fsync each.
+- **`bench.py`** times the engine through `Database.run` and the API through a real server, so every number includes parsing and planning. Each benchmark runs several times and reports the median. The garbage collector is paused while a run is timed, as `timeit` does. The results, and what they taught, are in [benchmarks.md](benchmarks.md).
+- **`demo.py`** starts the real server on a free port with a read key and a write key in a temporary folder, and walks through 12 requests, printing each one and its answer. A test checks every status code it gets.
+- **Two bugs found by measuring, not by tests.** The planner used one end of a range (fixed with `range_bounds`), and kept-alive HTTP requests waited about 40 ms each on Nagle's algorithm (fixed with `TCP_NODELAY`). Both answers were always correct, which is why 458 tests passed. Each fix now has a regression test.

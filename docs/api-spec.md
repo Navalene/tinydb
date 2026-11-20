@@ -3,9 +3,9 @@
 | | |
 |---|---|
 | **Document** | HTTP API specification |
-| **Version** | 0.6 (Phase 6). Designed in Phase 5, built in Phase 6 (`tinydb/server.py`). |
-| **Date** | 2026-11-19 |
-| **Related** | [requirements.md](requirements.md) (FR-24 to FR-28), [architecture.md](architecture.md), [openapi.yaml](openapi.yaml) |
+| **Version** | 1.0 (Phase 7). Designed in Phase 5, built in Phase 6 (`tinydb/server.py`), parameterized queries added in Phase 7. |
+| **Date** | 2026-11-20 |
+| **Related** | [requirements.md](requirements.md) (FR-24 to FR-28, FR-37 to FR-40), [architecture.md](architecture.md), [openapi.yaml](openapi.yaml), [benchmarks.md](benchmarks.md) |
 
 ## 1. Overview
 
@@ -40,13 +40,34 @@ Because QUERY must be safe, the server **parses the whole body first** and refus
 
 | Header | Required | Value |
 |---|---|---|
-| `Content-Type` | Yes, for `QUERY` and `POST` | `application/sql` (`charset=utf-8` may be added) |
+| `Content-Type` | Yes, for `QUERY` and `POST` | `application/sql` for plain SQL, or `application/json` for SQL with `?` values ([2.1](#21-parameterized-queries)). `charset=utf-8` may be added to either. |
 | `Content-Length` | Yes, for `QUERY` and `POST` | Size of the body in bytes. At most **1,048,576** (1 MB). |
 | `Authorization` | Yes, except for `GET /health` and `OPTIONS` | `Bearer <api key>`. A `read` key works on `/query`. A `write` key works on both paths. |
 
 Send exactly one `Content-Length` and no `Transfer-Encoding`. The body must arrive in full: if the connection ends early, nothing runs.
 
 The body is UTF-8 SQL text: one statement, or several (at most **100**) separated by `;`. Text values use single quotes (`'O''Brien'` for a quote inside text), and `--` starts a comment, the same as in the shell.
+
+### 2.1 Parameterized queries
+
+When values come from users or other programs, don't build SQL from strings. Write `?` where each value goes, and send the values separately as JSON:
+
+```json
+{"sql": "SELECT id, name FROM clients WHERE name = ? AND zip = ?", "params": ["Eve O'Brien", "33139"]}
+```
+
+| Field | Required | Value |
+|---|---|---|
+| `sql` | Yes | The SQL text, with a `?` for each value |
+| `params` | No (default `[]`) | One value per `?`, in order, across every statement in `sql`. Each is a string, number, `true`, `false` or `null`. |
+
+- A `?` can go anywhere a value can: `WHERE`, `VALUES` and `SET`. It can't stand for a table or column name.
+- Each value is placed into the parsed statement directly. It is never part of the SQL text, so quotes, `;` or `--` inside it are just characters. `O'Brien` needs no escaping.
+- Values are type-checked against their columns like any other value.
+- There must be exactly one value per `?`. Too few or too many is a `400 SqlError`, and nothing runs.
+- Any other field (a typo like `parms`) is a `400 BadRequest`. So are numbers over 30 digits, `NaN` and `Infinity`.
+
+Plain `application/sql` bodies work exactly as before.
 
 ## 3. Responses
 
@@ -105,12 +126,12 @@ Every response body is JSON with `Content-Type: application/json; charset=utf-8`
 
 | Status | `type` | When |
 |---|---|---|
-| `400` | `SqlError` | The SQL can't be read, like `SELECT * FROM clients WHERE` |
+| `400` | `SqlError` | The SQL can't be read, like `SELECT * FROM clients WHERE`, or the number of `params` doesn't match the `?`s |
 | `400` | `SchemaError` | A value or column doesn't fit the table, like a bad DATE or `No column named nme` |
 | `400` | `DatabaseError` | The statement can't run, like `No table named nope` or a duplicate primary key |
 | `400` | `WrongMethod` | A write was sent with `QUERY`, or a read with `POST`. The message says which method to use. |
 | `400` | `EmptyRequest` | The body holds no statement |
-| `400` | `BadRequest` | The body isn't valid UTF-8, ended before `Content-Length` bytes, has over 100 statements, or the length headers are ambiguous (two `Content-Length`s, or one with `Transfer-Encoding`) |
+| `400` | `BadRequest` | The body isn't valid UTF-8, ended before `Content-Length` bytes, has over 100 statements, or the length headers are ambiguous (two `Content-Length`s, or one with `Transfer-Encoding`). For JSON bodies: invalid JSON, not an object with a string `sql`, `params` not a list, an unknown field, a number over 30 digits, or `NaN`/`Infinity`. |
 | `401` | `Unauthorized` | Missing, wrong or revoked API key. Sent with `WWW-Authenticate: Bearer realm="tinydb"` (plus `error="invalid_token"` when a key was sent). |
 | `403` | `Forbidden` | A `read` key was used with `POST /execute` |
 | `404` | `NotFound` | No such path |
@@ -118,7 +139,7 @@ Every response body is JSON with `Content-Type: application/json; charset=utf-8`
 | `408` | `Timeout` | The body didn't arrive within 10 seconds |
 | `411` | `LengthRequired` | No `Content-Length` header |
 | `413` | `TooLarge` | Body over 1 MB |
-| `415` | `UnsupportedMediaType` | `Content-Type` isn't `application/sql`. Sent with `Accept-Query` (on `/query`). |
+| `415` | `UnsupportedMediaType` | `Content-Type` isn't `application/sql` or `application/json`. Sent with `Accept-Query` (on `/query`). |
 | `500` | `InternalError` | A bug in tinydb. The message is generic, so no internal details leak out. |
 | `501` | (no JSON) | A method tinydb doesn't know at all, like `PUT`. `http.server` sends this itself. |
 | `503` | `Busy` | 32 connections are already open. Sent with `Retry-After: 1`. |
@@ -138,7 +159,19 @@ curl -X QUERY http://127.0.0.1:8000/query \
                  ORDER BY deadline;"
 ```
 
-`200 OK`, with the response shown in [3.1](#31-success). The response also includes `Accept-Query: application/sql`.
+`200 OK`, with the response shown in [3.1](#31-success). The response also includes `Accept-Query: application/sql, application/json`.
+
+The same question with `?` placeholders. The heredoc (`<<'EOF'`) passes the JSON through untouched, so the quotes in it need no escaping:
+
+```bash
+curl -X QUERY http://127.0.0.1:8000/query \
+  -H "Authorization: Bearer $READ_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'EOF'
+{"sql": "SELECT client_id, reason, deadline FROM enrollment_periods WHERE period = ? AND deadline >= ? AND deadline <= ? ORDER BY deadline",
+ "params": ["SEP", "2026-11-18", "2026-12-31"]}
+EOF
+```
 
 Two reads in one request:
 
@@ -177,6 +210,12 @@ curl -X QUERY http://127.0.0.1:8000/query \
 
 To run a saved query from a file, use `--data-binary @sep_deadlines.sql`.
 
+An injection attempt in a parameter is only a value. This finds no client and changes nothing:
+
+```json
+{"sql": "SELECT id FROM clients WHERE name = ?", "params": ["x'; DROP TABLE clients; --"]}
+```
+
 ### 4.2 `POST /execute`
 
 Runs one or more write statements: `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `INSERT`, `UPDATE`, `DELETE`.
@@ -198,7 +237,14 @@ curl -X POST http://127.0.0.1:8000/execute \
 
 **Atomicity.** Each statement is atomic: all of its rows are saved, or none are. A body with several statements runs them in order and **stops at the first error**. Statements before the error stay saved, because tinydb has no transactions that span statements (see [requirements](requirements.md#7-out-of-scope)). The error response lists what already ran:
 
-`400 Bad Request`
+With `?` placeholders (one value per `?`, across both statements):
+
+```json
+{"sql": "INSERT INTO clients (id, name, birth_date) VALUES (?, ?, ?); UPDATE clients SET zip = ? WHERE id = ?",
+ "params": [8, "Nell O'Hara", "1961-11-30", "33101", 8]}
+```
+
+`400 Bad Request`, when a later statement in a body fails:
 
 ```json
 {
@@ -226,7 +272,7 @@ curl -i -X OPTIONS http://127.0.0.1:8000/query
 ```
 HTTP/1.1 204 No Content
 Allow: QUERY, OPTIONS
-Accept-Query: application/sql
+Accept-Query: application/sql, application/json
 ```
 
 `OPTIONS /execute` answers `204` with `Allow: POST, OPTIONS`. `Accept-Query` is the header RFC 10008 defines for "this resource takes QUERY, with these body formats".
@@ -240,7 +286,7 @@ curl http://127.0.0.1:8000/health
 `200 OK`
 
 ```json
-{"status": "ok", "version": "0.6.0"}
+{"status": "ok", "version": "1.0.0"}
 ```
 
 `version` is `tinydb.__version__`. This endpoint needs no API key, so a monitor can check the server without one.
@@ -253,12 +299,14 @@ curl http://127.0.0.1:8000/health
 | **Roles** | `read` keys: `QUERY /query` only. `write` keys: `/query` and `/execute`. The key is checked before the body is read. |
 | **Revoking** | `python3 main.py apikey revoke <id>`. The server rereads the keys file when it changes, so the key stops working right away. |
 | **Injection-safe parsing** | The body goes through the same lexer as the shell. Quoted text is always one value, so input can't change what a statement does. A write hidden after a read in a `QUERY` is refused before anything runs. |
+| **Parameterized queries** | With an `application/json` body, values travel in `params` and are placed into the parsed statement directly. They never pass through the lexer, so they can't become SQL, however carelessly an app handles user input. |
+| **Hostile JSON** | Numbers over 30 digits are refused before `int()` sees them (on Python 3.9, a million-digit number takes seconds to convert), and `NaN`/`Infinity` are refused. |
 | **Whole bodies only** | A body shorter than `Content-Length` runs nothing, so a dropped connection can't cut a `WHERE` off a `DELETE`. |
-| **Limits** | 1 MB body, 100 statements, 10 seconds of silence, 32 connections, 64-character names, 30-character numbers, 64-bit INTs, finite FLOATs. |
+| **Limits** | 1 MB body, 100 statements, 10 seconds of silence, 32 connections, 64-character names, 30-character numbers (in SQL and in JSON), 64-bit INTs, finite FLOATs. |
 | **No leaks** | A `500` never includes a traceback. Errors never repeat the API key. Control characters in a path are escaped in the server log. |
 | **Encryption at rest** | Start the server with `TINYDB_PASSPHRASE` set (or type it at the prompt) and every log line in the folder is encrypted. See [architecture.md](architecture.md#8-server-and-security-design-phase-6). |
 | **Local by default** | The server listens on `127.0.0.1`. Put HTTPS (a proxy such as nginx) in front before exposing it to a network, because API keys would otherwise travel in plain text. |
 
 ## 6. Not included yet
 
-Joins, `OR` and `GROUP BY` (not in the SQL yet), parameterized queries (`?` placeholders, so apps never build SQL from strings), rate limiting failed keys, paging large results, `ETag` caching, and `Content-Location` links that RFC 10008 allows a server to send so a client can re-run a query with `GET`.
+Joins, `OR` and `GROUP BY` (not in the SQL yet), a `?` for `LIMIT`, rate limiting failed keys, paging large results, `ETag` caching, and `Content-Location` links that RFC 10008 allows a server to send so a client can re-run a query with `GET`.

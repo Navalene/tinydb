@@ -28,6 +28,12 @@ then calls the method named do_ plus the HTTP method: do_GET, do_POST, and
 do_QUERY for QUERY. That's all it does. Routing, reading the body, checking
 it, running the SQL and writing JSON back are this file's job.
 
+Parameterized queries (Phase 7): send JSON instead of plain SQL, with a ?
+for each value and the values in a list. They never become part of the SQL text:
+
+    Content-Type: application/json
+    {"sql": "SELECT * FROM clients WHERE name = ?", "params": ["O'Brien"]}
+
 Limits that keep one client from tying up the server (Lesson 3):
     MAX_BODY         1 MB per request
     MAX_STATEMENTS   100 SQL statements per request
@@ -48,7 +54,7 @@ from urllib.parse import urlsplit
 import tinydb
 from tinydb.auth import KeyStore
 from tinydb.database import Database, DatabaseError, passphrase_for
-from tinydb.lexer import SqlError
+from tinydb.lexer import MAX_NUMBER_LENGTH, SqlError
 from tinydb.schema import SchemaError
 from tinydb.sql import Describe, Select, ShowTables, parse
 
@@ -57,6 +63,9 @@ MAX_STATEMENTS = 100
 REQUEST_TIMEOUT = 10.0  # seconds
 MAX_CONNECTIONS = 32
 SQL_TYPE = "application/sql"
+JSON_TYPE = "application/json"  # {"sql": "...", "params": [...]}
+BODY_TYPES = (SQL_TYPE, JSON_TYPE)
+ACCEPT_QUERY = ", ".join(BODY_TYPES)  # the Accept-Query header: what QUERY /query takes
 READS = (Select, ShowTables, Describe)  # the only statements QUERY may run
 
 # Sent with every JSON response. JSON is data, so a browser must never run it or show it in a frame.
@@ -84,6 +93,40 @@ class ApiError(Exception):
         self.message = message
         self.headers = headers or {}
         self.results = results or []  # statements that ran before the error
+
+
+def number_text(text):
+    """json.loads calls this for every whole number. Refuse absurdly long ones before int() sees them.
+
+    On Python 3.9, int() of a million-digit string takes seconds: a cheap way to stall a server.
+    """
+    if len(text) > MAX_NUMBER_LENGTH:
+        raise ValueError(f"A number in the JSON is too long (over {MAX_NUMBER_LENGTH} characters)")
+    return int(text)
+
+
+def no_constants(name):
+    """json.loads calls this for NaN, Infinity and -Infinity, which real JSON doesn't have."""
+    raise ValueError(f"{name} isn't valid JSON")
+
+
+def sql_and_params(media_type, text):
+    """Split a request body into (sql, params). Plain SQL has no params."""
+    if media_type == SQL_TYPE:
+        return text, ()
+    try:
+        body = json.loads(text, parse_int=number_text, parse_constant=no_constants)
+    except ValueError as e:  # bad JSON, a huge number, or NaN
+        raise ApiError(400, "BadRequest", f"The body isn't valid JSON: {e}") from None
+    if not isinstance(body, dict) or not isinstance(body.get("sql"), str):
+        raise ApiError(400, "BadRequest", 'Send a JSON object like {"sql": "SELECT * FROM t WHERE id = ?", "params": [4]}.')
+    unknown = sorted(set(body) - {"sql", "params"})
+    if unknown:
+        raise ApiError(400, "BadRequest", f"Unknown field {unknown[0]!r}. The JSON takes sql and params.")
+    params = body.get("params", [])
+    if not isinstance(params, list):
+        raise ApiError(400, "BadRequest", "params must be a list, like [4] or [\"O'Brien\", 65].")
+    return body["sql"], params
 
 
 def statement_word(statement):
@@ -119,6 +162,10 @@ class ApiHandler(BaseHTTPRequestHandler):
     server_version = "tinydb/" + tinydb.__version__
     sys_version = ""  # by default http.server also sends the Python version, which only helps attackers
     protocol_version = "HTTP/1.1"  # keep connections open between requests
+    # Send each reply's headers and body right away (TCP_NODELAY). Without it, the Nagle
+    # algorithm holds the body back until the client acknowledges the headers, and the
+    # client waits up to 40 ms to do that. Phase 7's benchmark found this: 43 ms per QUERY.
+    disable_nagle_algorithm = True
 
     def setup(self):
         """Runs before each connection is read. A client that goes quiet for request_timeout is disconnected."""
@@ -165,7 +212,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             else:
                 self.authenticate(path)
                 if path == "/query":
-                    self.send_json(200, {"results": self.run_sql(reads=True)}, {"Accept-Query": SQL_TYPE})
+                    self.send_json(200, {"results": self.run_sql(reads=True)}, {"Accept-Query": ACCEPT_QUERY})
                 else:
                     self.send_json(200, {"results": self.run_sql(reads=False)})
         except ApiError as e:
@@ -180,7 +227,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def send_options(self, path, allowed):
         headers = {"Allow": ", ".join(allowed)}
         if path == "/query":
-            headers["Accept-Query"] = SQL_TYPE
+            headers["Accept-Query"] = ACCEPT_QUERY
         self.send_response(204)
         for name, value in headers.items():
             self.send_header(name, value)
@@ -208,14 +255,16 @@ class ApiHandler(BaseHTTPRequestHandler):
     # ---- reading and checking the body ----
 
     def read_body(self):
-        """Check the headers, then read the body and return it as text."""
+        """Check the headers, then read the body. Returns (media type, body as text)."""
         content_type = self.headers.get("Content-Type", "")
         media_type, _, params = content_type.partition(";")
+        media_type = media_type.strip().lower()
         charset = params.strip().lower()
-        if media_type.strip().lower() != SQL_TYPE or charset not in ("", "charset=utf-8"):
-            headers = {"Accept-Query": SQL_TYPE} if self.command == "QUERY" else {}
+        if media_type not in BODY_TYPES or charset not in ("", "charset=utf-8"):
+            headers = {"Accept-Query": ACCEPT_QUERY} if self.command == "QUERY" else {}
             raise ApiError(415, "UnsupportedMediaType",
-                           f"Send SQL as Content-Type: {SQL_TYPE}, not {content_type or 'nothing'}.", headers)
+                           f"Send SQL as Content-Type: {SQL_TYPE}, or SQL with ? values as {JSON_TYPE}, "
+                           f"not {content_type or 'nothing'}.", headers)
 
         lengths = self.headers.get_all("Content-Length") or []
         if len(lengths) > 1 or ("Transfer-Encoding" in self.headers and lengths):
@@ -241,7 +290,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "BadRequest", f"The body ended after {len(raw)} of {length} bytes. Nothing was run.")
         self.body_read = True
         try:
-            return raw.decode("utf-8")
+            return media_type, raw.decode("utf-8")
         except UnicodeDecodeError:
             raise ApiError(400, "BadRequest", "The body must be UTF-8 text.") from None
 
@@ -252,9 +301,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
         reads=True is QUERY: only reads allowed. reads=False is POST: only writes allowed.
         """
-        text = self.read_body()
+        sql, params = sql_and_params(*self.read_body())
         try:
-            statements = parse(text)
+            statements = parse(sql, params)  # every ? is filled here, as a value, never as SQL text
         except (ValueError, TypeError) as e:
             raise ApiError(400, error_kind(e), str(e)) from None
         if not statements:

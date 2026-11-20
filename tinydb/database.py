@@ -19,6 +19,10 @@ every log in the folder. The first time, it writes _crypto.json with the salt
 and a "check" value. Every later open must give the same passphrase, and a
 wrong one is refused before any log is read, so nothing is ever trimmed by
 mistake.
+
+Phase 7: the benchmarks showed that a range like deadline >= X AND deadline <= Y
+on a B-tree index used only its first condition, so it read most of the table.
+range_bounds now hands the B-tree both ends.
 """
 
 import base64
@@ -158,6 +162,25 @@ def matches(row, condition):
     return COMPARE[condition.op](value, condition.value)
 
 
+def range_bounds(conditions, column):
+    """The tightest (low, high) that every range condition on column allows. None means no limit.
+
+    deadline >= '2026-11-05' AND deadline <= '2026-11-12' gives both ends, so a
+    B-tree reads one week of rows instead of everything after November 5.
+    The bounds are inclusive. A strict < or > also lets the edge value through,
+    and the check in _find removes it.
+    """
+    low = high = None
+    for c in conditions:
+        if c.column != column:
+            continue
+        if c.op in (">", ">=") and (low is None or c.value > low):
+            low = c.value
+        elif c.op in ("<", "<=") and (high is None or c.value < high):
+            high = c.value
+    return low, high
+
+
 class Database:
     """A folder of tables. Open it, then call run("SELECT ...") or execute(statement)."""
 
@@ -236,9 +259,12 @@ class Database:
 
     # ---- running SQL ----
 
-    def run(self, sql):
-        """Parse SQL text and run every statement in it. Returns a list of Results."""
-        return [self.execute(statement) for statement in parse(sql)]
+    def run(self, sql, params=()):
+        """Parse SQL text and run every statement in it. Returns a list of Results.
+
+        params fills the ? placeholders in order: run("SELECT * FROM clients WHERE id = ?", [4]).
+        """
+        return [self.execute(statement) for statement in parse(sql, params)]
 
     def execute(self, statement):
         """Run one parsed statement and return a Result."""
@@ -352,7 +378,7 @@ class Database:
 
     @staticmethod
     def _candidates(table, schema, conditions):
-        """Use one condition to pick the rows worth checking, the fastest way available."""
+        """Use one column's conditions to pick the rows worth checking, the fastest way available."""
         for c in conditions:
             if c.op == "=" and c.column == schema.primary_key:
                 record = table.get(str(c.value))
@@ -363,7 +389,6 @@ class Database:
                 return table.find(c.column, c.value), table.last_plan
         for c in conditions:
             if c.op in ("<", "<=", ">", ">=") and indexed.get(c.column) == "btree":
-                low = c.value if c.op in (">", ">=") else None
-                high = c.value if c.op in ("<", "<=") else None
+                low, high = range_bounds(conditions, c.column)
                 return table.find_range(c.column, low, high), table.last_plan
         return table.records(), "full scan"

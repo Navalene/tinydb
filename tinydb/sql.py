@@ -20,16 +20,25 @@ Supported statements:
     DELETE FROM t [WHERE ...]
     SHOW TABLES
     DESCRIBE t
+
+Phase 7: anywhere a value can go, a ? placeholder can go instead, and the
+values are passed separately, in order:
+
+    parse("SELECT * FROM clients WHERE name = ? AND age > ?", ["O'Brien", 65])
+
+A value never passes through the lexer, so it can't be read as SQL, whatever
+it contains. That's what makes parameterized queries injection-proof.
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 from tinydb.lexer import END, KEYWORD, NAME, NUMBER, STRING, SYMBOL, SqlError, tokenize
 from tinydb.schema import TYPES, Column
 
 COMPARISONS = ("=", "!=", "<", "<=", ">", ">=")
 INDEX_KINDS = ("HASH", "BTREE")
+PARAM_TYPES = (str, bool, int, float, type(None))  # what a ? value may be: the same kinds a literal can be
 
 
 # ---- statements: what the parser produces ----
@@ -108,9 +117,11 @@ class Describe:
 class SqlParser:
     """Reads one or more SQL statements. Make a new parser for each piece of text."""
 
-    def __init__(self, text):
+    def __init__(self, text, params: Sequence[Any] = ()):
         self.tokens = tokenize(text)
         self.pos = 0
+        self.params = check_params(params)
+        self.used = 0  # how many ? placeholders have been filled so far
 
     # -- reading tokens --
 
@@ -158,6 +169,8 @@ class SqlParser:
             while self.accept(SYMBOL, ";"):
                 pass
             if self.peek().kind == END:
+                if self.used != len(self.params):
+                    raise SqlError(f"Too many values: got {len(self.params)} for {self.used} ? placeholder(s)")
                 return statements
             statements.append(self.statement())
             if self.peek().kind != END:
@@ -322,10 +335,12 @@ class SqlParser:
         return Condition(column, token.value, value)
 
     def literal(self):
-        """A value: a number, 'text', TRUE, FALSE or NULL."""
+        """A value: a number, 'text', TRUE, FALSE, NULL, or a ? placeholder."""
         token = self.peek()
         if token.kind in (NUMBER, STRING):
             return self.advance().value
+        if self.accept(SYMBOL, "?"):
+            return self.placeholder(token)
         if self.accept(KEYWORD, "TRUE"):
             return True
         if self.accept(KEYWORD, "FALSE"):
@@ -334,7 +349,29 @@ class SqlParser:
             return None
         raise SqlError(f"Expected a value but found {token.describe()} at position {token.position}")
 
+    def placeholder(self, token):
+        """The next value from params, for the ? just read."""
+        if self.used >= len(self.params):
+            raise SqlError(f"Not enough values: the ? at position {token.position} needs value "
+                           f"{self.used + 1}, but only {len(self.params)} were given")
+        value = self.params[self.used]
+        self.used += 1
+        return value
 
-def parse(text):
-    """Parse SQL text into a list of statements."""
-    return SqlParser(text).parse_script()
+
+def check_params(params):
+    """Check the values for ? placeholders and return them as a tuple."""
+    if isinstance(params, (str, bytes, dict)):
+        # A string is a sequence too: "Ada" would quietly become 3 values, "A", "d", "a".
+        raise SqlError("Values for ? placeholders must be a list, like [\"Ada\", 70]")
+    params = tuple(params)
+    for number, value in enumerate(params, 1):
+        if not isinstance(value, PARAM_TYPES):
+            raise SqlError(f"Value {number} for a ? placeholder is a {type(value).__name__}. "
+                           "Use a number, text, true, false or null")
+    return params
+
+
+def parse(text, params: Sequence[Any] = ()):
+    """Parse SQL text into a list of statements, filling each ? with the next value in params."""
+    return SqlParser(text, params).parse_script()
